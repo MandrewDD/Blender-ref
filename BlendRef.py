@@ -13,6 +13,8 @@ import os
 from gpu_extras.batch import batch_for_shader
 
 _handle = None
+NODE_HEADER_HEIGHT = 120
+NODE_SPACING = 50
 
 
 # =========================================================
@@ -53,7 +55,7 @@ def align_nodes_row(nodes, active):
         n.location.x = start_x + offset_x
         n.location.y = y
 
-        offset_x += w + 50
+        offset_x += w + NODE_SPACING
 
 
 def align_nodes_col(nodes, active):
@@ -76,10 +78,11 @@ def align_nodes_col(nodes, active):
     for n in ordered_nodes:
         h = n.image.size[1] * n.scale
 
+        if n != active:
+            offset_y += h + NODE_HEADER_HEIGHT + NODE_SPACING
+
         n.location.x = x
         n.location.y = start_y - offset_y
-
-        offset_y += h + 50
 
 
 def tag_refboard_redraw(context):
@@ -587,7 +590,7 @@ def register():
     bpy.types.NODE_MT_add.append(draw_in_node_add_menu)
 
     _handle = bpy.types.SpaceNodeEditor.draw_handler_add(
-        draw_callback, (), "WINDOW", "POST_PIXEL"
+        draw_callback, (), "WINDOW", "BACKDROP"
     )
 
 
