@@ -19,6 +19,7 @@ NODE_HEADER_HEIGHT = 120
 NODE_SPACING = 50
 DRAW_HANDLER_TYPE = "PRE_VIEW"
 OUTLINE_WIDTH = 2.0
+SCALE_EPSILON = 0.0001
 
 
 # =========================================================
@@ -302,6 +303,44 @@ def get_node_outline_color(node, active_node, colors):
     return colors["normal"]
 
 
+def get_selection_center(nodes):
+    total_x = sum(n.location.x for n in nodes)
+    total_y = sum(n.location.y for n in nodes)
+    count = len(nodes)
+
+    return (total_x / count, total_y / count)
+
+
+def get_scale_pivot(nodes):
+    if len(nodes) == 1:
+        node = nodes[0]
+        node_width = getattr(node, "width", 0.0)
+        node_height = getattr(node, "height", NODE_HEADER_HEIGHT)
+
+        return (
+            node.location.x + node_width * 0.5,
+            node.location.y - node_height * 0.5
+        )
+
+    return get_selection_center(nodes)
+
+
+def get_scale_factor_from_mouse(pivot, start_location, current_location):
+    start_distance = math.hypot(
+        start_location[0] - pivot[0],
+        start_location[1] - pivot[1]
+    )
+    current_distance = math.hypot(
+        current_location[0] - pivot[0],
+        current_location[1] - pivot[1]
+    )
+
+    if start_distance <= SCALE_EPSILON:
+        return 1.0
+
+    return max(current_distance / start_distance, SCALE_EPSILON)
+
+
 # =========================================================
 # UI SCALE
 # =========================================================
@@ -548,6 +587,117 @@ class RB_OT_select_image(bpy.types.Operator):
         tag_refboard_redraw(context)
 
         return {'FINISHED'}
+
+
+# =========================================================
+# SCALE TRANSFORM
+# =========================================================
+
+class RB_OT_scale_with_images(bpy.types.Operator):
+    bl_idname = "refboard.scale_with_images"
+    bl_label = "Scale Images"
+    bl_description = "Scale selected RefBoard images and spread selected nodes from their center"
+    bl_options = {'INTERNAL'}
+
+    _node_names = None
+    _initial_locations = None
+    _initial_scales = None
+    _pivot = None
+    _start_mouse_location = None
+
+    @classmethod
+    def poll(cls, context):
+        return is_refboard_context(context)
+
+    def get_nodes(self, context):
+        tree = context.space_data.node_tree
+
+        return [
+            tree.nodes[name]
+            for name in self._node_names
+            if name in tree.nodes
+            and tree.nodes[name].bl_idname == "RefBoardImageNodeType"
+            and tree.nodes[name].image
+        ]
+
+    def apply_scale(self, context, factor):
+        nodes = self.get_nodes(context)
+
+        for node in nodes:
+            initial_location = self._initial_locations[node.name]
+
+            if len(nodes) > 1:
+                node.location.x = self._pivot[0] + (initial_location[0] - self._pivot[0]) * factor
+                node.location.y = self._pivot[1] + (initial_location[1] - self._pivot[1]) * factor
+
+            node.scale = self._initial_scales[node.name] * factor
+
+        tag_refboard_redraw(context)
+
+    def restore_transform(self, context):
+        for node in self.get_nodes(context):
+            initial_location = self._initial_locations[node.name]
+            node.location.x = initial_location[0]
+            node.location.y = initial_location[1]
+            node.scale = self._initial_scales[node.name]
+
+        tag_refboard_redraw(context)
+
+    def invoke(self, context, event):
+
+        tree = context.space_data.node_tree
+        nodes = [
+            n for n in tree.nodes
+            if n.bl_idname == "RefBoardImageNodeType"
+            and n.image
+            and n.select
+        ]
+
+        if not nodes:
+            return {'PASS_THROUGH'}
+
+        self._node_names = [n.name for n in nodes]
+        self._initial_locations = {
+            n.name: (n.location.x, n.location.y)
+            for n in nodes
+        }
+        self._initial_scales = {
+            n.name: n.scale
+            for n in nodes
+        }
+        self._pivot = get_scale_pivot(nodes)
+        self._start_mouse_location = get_event_view_location(context, event)
+
+        if not self._start_mouse_location:
+            return {'CANCELLED'}
+
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+
+        if not is_refboard_context(context):
+            return {'CANCELLED'}
+
+        if event.type == 'MOUSEMOVE':
+            current_location = get_event_view_location(context, event)
+
+            if current_location:
+                factor = get_scale_factor_from_mouse(
+                    self._pivot,
+                    self._start_mouse_location,
+                    current_location
+                )
+                self.apply_scale(context, factor)
+
+        elif event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'RELEASE':
+            return {'FINISHED'}
+
+        elif event.type in {'ESC', 'RIGHTMOUSE'}:
+            self.restore_transform(context)
+            return {'CANCELLED'}
+
+        return {'RUNNING_MODAL'}
 
 
 # =========================================================
@@ -893,6 +1043,7 @@ classes = (
     RB_OT_align_nodes,
     RB_OT_match_size,
     RB_OT_select_image,
+    RB_OT_scale_with_images,
     RB_OT_drop_image_node,
     RB_FH_image_drop,
     RB_OT_add_image_menu,
@@ -935,6 +1086,8 @@ def register():
             shift=True,
             ctrl=True
         )
+        _keymaps.append((km, kmi))
+        kmi = km.keymap_items.new("refboard.scale_with_images", "S", "PRESS")
         _keymaps.append((km, kmi))
 
 
