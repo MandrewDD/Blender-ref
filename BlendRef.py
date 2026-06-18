@@ -964,9 +964,12 @@ class RB_FH_image_drop(bpy.types.FileHandler):
 class RB_OT_add_image_node(bpy.types.Operator):
     bl_idname = "refboard.add_image"
     bl_label = "Add Image"
-    bl_description = "Choose an image file and add it as a RefBoard image node"
+    bl_description = "Choose one or more image files and add them as RefBoard image nodes"
 
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    directory: bpy.props.StringProperty(subtype="DIR_PATH")
+    files: bpy.props.CollectionProperty(type=bpy.types.OperatorFileListElement)
+    filter_image: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
     location: bpy.props.FloatVectorProperty(size=2)
 
     @classmethod
@@ -983,14 +986,35 @@ class RB_OT_add_image_node(bpy.types.Operator):
     def execute(self, context):
 
         tree = context.space_data.node_tree
-        img = bpy.data.images.load(self.filepath, check_existing=True)
+        paths = []
 
-        node = tree.nodes.new("RefBoardImageNodeType")
-        node.image = img
-        node.location = self.location
+        if self.files:
+            paths = [os.path.join(self.directory, f.name) for f in self.files]
+        elif self.filepath:
+            paths = [self.filepath]
 
-        node.select = True
-        tree.nodes.active = node
+        if not paths:
+            return {'CANCELLED'}
+
+        for node in tree.nodes:
+            node.select = False
+
+        created_nodes = []
+
+        for filepath in paths:
+            img = bpy.data.images.load(filepath, check_existing=True)
+
+            node = tree.nodes.new("RefBoardImageNodeType")
+            node.image = img
+            node.location = self.location
+
+            node.select = True
+            created_nodes.append(node)
+
+        tree.nodes.active = created_nodes[0]
+
+        if len(created_nodes) > 1:
+            align_nodes_row(created_nodes, created_nodes[0])
 
         tag_refboard_redraw(context)
 
@@ -1004,7 +1028,7 @@ class RB_OT_add_image_node(bpy.types.Operator):
 class RB_OT_add_image_menu(bpy.types.Operator):
     bl_idname = "refboard.add_image_menu"
     bl_label = "Add Image"
-    bl_description = "Choose an image file and add it to the current RefBoard"
+    bl_description = "Choose one or more image files and add them to the current RefBoard"
 
     @classmethod
     def poll(cls, context):
