@@ -1,74 +1,37 @@
 # RefBoard
 
-RefBoard is a small Blender add-on for keeping image references inside Blender, in a dedicated node editor.
+RefBoard is a Blender add-on for keeping image references in a dedicated node editor.
 
-It is not trying to replace PureRef or Blender's built-in reference images. The idea is simpler: when you are already working in Blender and want a quick board of images next to your materials, geometry nodes, or scene work, RefBoard gives you a clean place to drop them.
+It is made for quick boards: drop in a few images, arrange them, match sizes when needed, and keep working inside Blender.
 
-## What it does
+## Features
 
-- Adds a dedicated `RefBoard` node tree.
-- Lets you drag and drop images into the node editor.
-- Lets you add one or several images from the sidebar.
-- Draws images behind their nodes, so the nodes stay readable and selectable.
-- Supports click selection on the image itself.
-- Keeps image outlines in the same spirit as Blender's node selection colors.
-- Arranges selected images as a row, column, or automatic grid.
-- Matches selected image width or height to the active image.
-- Scales image boards with `S`, including multiple selected nodes.
+- Drag and drop images into a RefBoard node tree.
+- Add one or several images from the sidebar.
+- Arrange selected images as a row, column, or automatic grid.
+- Match selected image width or height to the active image.
+- Select nodes by clicking their image area.
+- Draw images behind their nodes with Blender-style outlines.
 
-## Supported image formats
+## Supported formats
 
-RefBoard currently accepts:
+PNG, JPG, JPEG, TGA, BMP, EXR, and WEBP.
 
-- PNG
-- JPG / JPEG
-- TGA
-- BMP
-- EXR
-- WEBP
+## Install
 
-## Installation
-
-For a normal install, use the packaged zip from the `release` folder:
+Use the packaged zip:
 
 ```text
 release/refboard-1.2.0.zip
 ```
 
-In Blender:
+The add-on is being prepared for Blender Extensions as well.
 
-1. Open `Edit > Preferences > Add-ons`.
-2. Choose `Install from Disk`.
-3. Select `refboard-1.2.0.zip`.
-4. Enable `RefBoard`.
+## Feedback
 
-The add-on is also being prepared for Blender Extensions, so the long-term goal is installation directly from Blender.
-
-## Basic use
-
-Open a Node Editor and switch to the `RefBoard` tree type.
-
-You can then:
-
-- drag images into the editor;
-- use the `RefBoard` tab in the sidebar;
-- select images by clicking their drawn image area;
-- use `Row`, `Column`, or `Grid` to tidy up selected images;
-- use `Width` or `Height` under `Match Size` to match selected images to the active one;
-- use `S` to scale selected RefBoard images.
-
-## Notes
-
-This is still early release work. The current focus is keeping the add-on simple, predictable, and comfortable to use inside Blender.
-
-If something feels off, please open an issue with:
-
-- Blender version;
-- operating system;
-- what you clicked or dragged;
-- a short screenshot or screen recording if possible.
+If something breaks, please include your Blender version, operating system, and a short description of what happened.
 
 ## License
 
-RefBoard is licensed under GPL-3.0-or-later.
+GPL-3.0-or-later.
 
