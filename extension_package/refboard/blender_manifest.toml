@@ -4,7 +4,8 @@ id = "refboard"
 version = "1.2.0"
 name = "RefBoard"
 tagline = "Arrange image references inside a dedicated node editor"
-maintainer = "Mandrew3D"
+maintainer = "Mandrew3D <moseenkowam@gmail.com>"
+website = "https://github.com/MandrewDD/Blender-ref"
 type = "add-on"
 
 tags = ["Node"]

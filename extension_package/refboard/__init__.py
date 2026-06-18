@@ -1,6 +1,6 @@
 bl_info = {
     "name": "RefBoard",
-    "author": "Mandrew3D",
+    "author": "Mandrew3D <moseenkowam@gmail.com>",
     "version": (1, 2, 0),
     "blender": (5, 1, 0),
     "category": "Node",
@@ -16,6 +16,7 @@ from gpu_extras.batch import batch_for_shader
 _handle = None
 _keymaps = []
 _click_candidate = None
+_menu_added = False
 NODE_HEADER_HEIGHT = 120
 NODE_SPACING = 50
 DRAW_HANDLER_TYPE = "PRE_VIEW"
@@ -133,6 +134,28 @@ def tag_refboard_redraw(context):
 
     if area:
         area.tag_redraw()
+
+
+def get_image_filepaths(operator):
+    if operator.files:
+        return [
+            bpy.path.abspath(os.path.join(operator.directory, f.name))
+            for f in operator.files
+        ]
+
+    if operator.filepath:
+        return [bpy.path.abspath(operator.filepath)]
+
+    return []
+
+
+def load_image_for_operator(operator, filepath):
+    try:
+        return bpy.data.images.load(filepath, check_existing=True)
+    except RuntimeError as exc:
+        operator.report({'WARNING'}, f"Could not load image: {filepath}")
+        print(f"RefBoard: could not load image {filepath!r}: {exc}")
+        return None
 
 
 def update_node_draw(self, context):
@@ -818,71 +841,77 @@ def draw_callback():
     gpu.state.blend_set('ALPHA')
     gpu.state.line_width_set(OUTLINE_WIDTH)
 
-    nodes = sorted(
-        [n for n in tree.nodes if n.bl_idname == "RefBoardImageNodeType" and n.image],
-        key=lambda n: n.z_order
-    )
-
-    for node in nodes:
-
-        img = node.image
-        tex = gpu.texture.from_image(img)
-
-        w = img.size[0] * node.scale
-        h = img.size[1] * node.scale
-
-        if DRAW_HANDLER_TYPE in {"PRE_VIEW", "POST_VIEW"}:
-            x1 = node.location.x * ui_scale
-            y1 = node.location.y * ui_scale
-            x2 = (node.location.x + w) * ui_scale
-            y2 = (node.location.y + h) * ui_scale
-        else:
-            x1, y1 = v2d.view_to_region(node.location.x * ui_scale, node.location.y * ui_scale, clip=False)
-            x2, y2 = v2d.view_to_region((node.location.x + w) * ui_scale, (node.location.y + h) * ui_scale, clip=False)
-
-        coords = (
-            (x1, y1),
-            (x2, y1),
-            (x2, y2),
-            (x1, y2),
+    try:
+        nodes = sorted(
+            [n for n in tree.nodes if n.bl_idname == "RefBoardImageNodeType" and n.image],
+            key=lambda n: n.z_order
         )
 
-        uvs = (
-            (0, 0),
-            (1, 0),
-            (1, 1),
-            (0, 1),
-        )
+        for node in nodes:
 
-        batch = batch_for_shader(image_shader, "TRI_FAN", {
-            "pos": coords,
-            "texCoord": uvs,
-        })
+            img = node.image
 
-        image_shader.bind()
-        image_shader.uniform_sampler("image", tex)
-        batch.draw(image_shader)
+            try:
+                tex = gpu.texture.from_image(img)
+            except Exception as exc:
+                print(f"RefBoard: could not draw image {img.name!r}: {exc}")
+                continue
 
-        outline_coords = (
-            (x1, y1),
-            (x2, y1),
-            (x2, y2),
-            (x1, y2),
-            (x1, y1),
-        )
-        outline_batch = batch_for_shader(outline_shader, "LINE_STRIP", {
-            "pos": outline_coords,
-        })
+            w = img.size[0] * node.scale
+            h = img.size[1] * node.scale
 
-        outline_shader.bind()
-        outline_shader.uniform_float(
-            "color",
-            get_node_outline_color(node, active_node, outline_colors)
-        )
-        outline_batch.draw(outline_shader)
+            if DRAW_HANDLER_TYPE in {"PRE_VIEW", "POST_VIEW"}:
+                x1 = node.location.x * ui_scale
+                y1 = node.location.y * ui_scale
+                x2 = (node.location.x + w) * ui_scale
+                y2 = (node.location.y + h) * ui_scale
+            else:
+                x1, y1 = v2d.view_to_region(node.location.x * ui_scale, node.location.y * ui_scale, clip=False)
+                x2, y2 = v2d.view_to_region((node.location.x + w) * ui_scale, (node.location.y + h) * ui_scale, clip=False)
 
-    gpu.state.line_width_set(1.0)
-    gpu.state.blend_set('NONE')
+            coords = (
+                (x1, y1),
+                (x2, y1),
+                (x2, y2),
+                (x1, y2),
+            )
+
+            uvs = (
+                (0, 0),
+                (1, 0),
+                (1, 1),
+                (0, 1),
+            )
+
+            batch = batch_for_shader(image_shader, "TRI_FAN", {
+                "pos": coords,
+                "texCoord": uvs,
+            })
+
+            image_shader.bind()
+            image_shader.uniform_sampler("image", tex)
+            batch.draw(image_shader)
+
+            outline_coords = (
+                (x1, y1),
+                (x2, y1),
+                (x2, y2),
+                (x1, y2),
+                (x1, y1),
+            )
+            outline_batch = batch_for_shader(outline_shader, "LINE_STRIP", {
+                "pos": outline_coords,
+            })
+
+            outline_shader.bind()
+            outline_shader.uniform_float(
+                "color",
+                get_node_outline_color(node, active_node, outline_colors)
+            )
+            outline_batch.draw(outline_shader)
+    finally:
+        gpu.state.line_width_set(1.0)
+        gpu.state.blend_set('NONE')
 
 
 # =========================================================
@@ -906,12 +935,7 @@ class RB_OT_drop_image_node(bpy.types.Operator):
     def execute(self, context):
 
         tree = context.space_data.node_tree
-        paths = []
-
-        if self.files:
-            paths = [os.path.join(self.directory, f.name) for f in self.files]
-        elif self.filepath:
-            paths = [self.filepath]
+        paths = get_image_filepaths(self)
 
         if not paths:
             return {'CANCELLED'}
@@ -924,7 +948,10 @@ class RB_OT_drop_image_node(bpy.types.Operator):
         created_nodes = []
 
         for filepath in paths:
-            img = bpy.data.images.load(filepath, check_existing=True)
+            img = load_image_for_operator(self, filepath)
+
+            if not img:
+                continue
 
             node = tree.nodes.new("RefBoardImageNodeType")
             node.image = img
@@ -932,6 +959,9 @@ class RB_OT_drop_image_node(bpy.types.Operator):
 
             node.select = True
             created_nodes.append(node)
+
+        if not created_nodes:
+            return {'CANCELLED'}
 
         tree.nodes.active = created_nodes[0]
         align_nodes_row(created_nodes, created_nodes[0])
@@ -986,12 +1016,7 @@ class RB_OT_add_image_node(bpy.types.Operator):
     def execute(self, context):
 
         tree = context.space_data.node_tree
-        paths = []
-
-        if self.files:
-            paths = [os.path.join(self.directory, f.name) for f in self.files]
-        elif self.filepath:
-            paths = [self.filepath]
+        paths = get_image_filepaths(self)
 
         if not paths:
             return {'CANCELLED'}
@@ -1002,7 +1027,10 @@ class RB_OT_add_image_node(bpy.types.Operator):
         created_nodes = []
 
         for filepath in paths:
-            img = bpy.data.images.load(filepath, check_existing=True)
+            img = load_image_for_operator(self, filepath)
+
+            if not img:
+                continue
 
             node = tree.nodes.new("RefBoardImageNodeType")
             node.image = img
@@ -1010,6 +1038,9 @@ class RB_OT_add_image_node(bpy.types.Operator):
 
             node.select = True
             created_nodes.append(node)
+
+        if not created_nodes:
+            return {'CANCELLED'}
 
         tree.nodes.active = created_nodes[0]
 
@@ -1123,17 +1154,31 @@ classes = (
 )
 
 
-_handle = None
-
-
 def register():
 
-    global _handle, _keymaps
+    global _handle, _keymaps, _menu_added
+
+    if _handle:
+        bpy.types.SpaceNodeEditor.draw_handler_remove(_handle, "WINDOW")
+        _handle = None
+
+    for km, kmi in _keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except RuntimeError:
+            pass
+
+    _keymaps.clear()
 
     for c in classes:
-        bpy.utils.register_class(c)
+        try:
+            bpy.utils.register_class(c)
+        except RuntimeError:
+            pass
 
-    bpy.types.NODE_MT_add.append(draw_in_node_add_menu)
+    if not _menu_added:
+        bpy.types.NODE_MT_add.append(draw_in_node_add_menu)
+        _menu_added = True
 
     _handle = bpy.types.SpaceNodeEditor.draw_handler_add(
         draw_callback, (), "WINDOW", DRAW_HANDLER_TYPE
@@ -1165,21 +1210,37 @@ def register():
 
 def unregister():
 
-    global _handle, _keymaps
+    global _handle, _keymaps, _menu_added
 
-    bpy.types.NODE_MT_add.remove(draw_in_node_add_menu)
+    if _menu_added:
+        try:
+            bpy.types.NODE_MT_add.remove(draw_in_node_add_menu)
+        except (AttributeError, ValueError):
+            pass
+
+        _menu_added = False
 
     for km, kmi in _keymaps:
-        km.keymap_items.remove(kmi)
+        try:
+            km.keymap_items.remove(kmi)
+        except RuntimeError:
+            pass
 
     _keymaps.clear()
 
     if _handle:
-        bpy.types.SpaceNodeEditor.draw_handler_remove(_handle, "WINDOW")
+        try:
+            bpy.types.SpaceNodeEditor.draw_handler_remove(_handle, "WINDOW")
+        except (ReferenceError, RuntimeError):
+            pass
+
         _handle = None
 
     for c in reversed(classes):
-        bpy.utils.unregister_class(c)
+        try:
+            bpy.utils.unregister_class(c)
+        except RuntimeError:
+            pass
 
 
 if __name__ == "__main__":
