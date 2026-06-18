@@ -15,11 +15,13 @@ from gpu_extras.batch import batch_for_shader
 
 _handle = None
 _keymaps = []
+_click_candidate = None
 NODE_HEADER_HEIGHT = 120
 NODE_SPACING = 50
 DRAW_HANDLER_TYPE = "PRE_VIEW"
 OUTLINE_WIDTH = 2.0
 SCALE_EPSILON = 0.0001
+CLICK_DRAG_THRESHOLD = 5
 
 
 # =========================================================
@@ -550,27 +552,22 @@ class RB_OT_select_image(bpy.types.Operator):
     bl_description = "Select the RefBoard node whose image is under the cursor"
     bl_options = {'INTERNAL'}
 
+    _node_name = ""
+    _shift = False
+    _ctrl = False
+
     @classmethod
     def poll(cls, context):
         return is_refboard_context(context)
 
-    def invoke(self, context, event):
-
-        if event.value != "PRESS":
-            return {'PASS_THROUGH'}
-
-        location = get_event_view_location(context, event)
-
-        if not location:
-            return {'PASS_THROUGH'}
-
+    def select_node(self, context):
         tree = context.space_data.node_tree
-        node = find_image_node_at_location(tree, location)
+        node = tree.nodes.get(self._node_name)
 
         if not node:
-            return {'PASS_THROUGH'}
+            return {'CANCELLED'}
 
-        if event.shift or event.ctrl:
+        if self._shift or self._ctrl:
             node.select = not node.select
 
             if not node.select and tree.nodes.active == node:
@@ -587,6 +584,56 @@ class RB_OT_select_image(bpy.types.Operator):
         tag_refboard_redraw(context)
 
         return {'FINISHED'}
+
+    def invoke(self, context, event):
+
+        global _click_candidate
+
+        location = get_event_view_location(context, event)
+
+        if not location:
+            return {'PASS_THROUGH'}
+
+        tree = context.space_data.node_tree
+        node = find_image_node_at_location(tree, location)
+
+        if event.value == "PRESS":
+            if not node:
+                _click_candidate = None
+                return {'PASS_THROUGH'}
+
+            _click_candidate = {
+                "node_name": node.name,
+                "mouse": (event.mouse_x, event.mouse_y),
+                "shift": event.shift,
+                "ctrl": event.ctrl,
+            }
+
+            return {'PASS_THROUGH'}
+
+        if event.value == "RELEASE":
+            if not _click_candidate:
+                return {'PASS_THROUGH'}
+
+            dx = event.mouse_x - _click_candidate["mouse"][0]
+            dy = event.mouse_y - _click_candidate["mouse"][1]
+
+            if math.hypot(dx, dy) > CLICK_DRAG_THRESHOLD:
+                _click_candidate = None
+                return {'PASS_THROUGH'}
+
+            if not node or node.name != _click_candidate["node_name"]:
+                _click_candidate = None
+                return {'PASS_THROUGH'}
+
+            self._node_name = _click_candidate["node_name"]
+            self._shift = _click_candidate["shift"]
+            self._ctrl = _click_candidate["ctrl"]
+            _click_candidate = None
+
+            return self.select_node(context)
+
+        return {'PASS_THROUGH'}
 
 
 # =========================================================
@@ -1073,20 +1120,21 @@ def register():
 
     if kc:
         km = kc.keymaps.new(name="Node Editor", space_type="NODE_EDITOR")
-        kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", "PRESS")
-        _keymaps.append((km, kmi))
-        kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", "PRESS", shift=True)
-        _keymaps.append((km, kmi))
-        kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", "PRESS", ctrl=True)
-        _keymaps.append((km, kmi))
-        kmi = km.keymap_items.new(
-            "refboard.select_image",
-            "LEFTMOUSE",
-            "PRESS",
-            shift=True,
-            ctrl=True
-        )
-        _keymaps.append((km, kmi))
+        for value in ("PRESS", "RELEASE"):
+            kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", value)
+            _keymaps.append((km, kmi))
+            kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", value, shift=True)
+            _keymaps.append((km, kmi))
+            kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", value, ctrl=True)
+            _keymaps.append((km, kmi))
+            kmi = km.keymap_items.new(
+                "refboard.select_image",
+                "LEFTMOUSE",
+                value,
+                shift=True,
+                ctrl=True
+            )
+            _keymaps.append((km, kmi))
         kmi = km.keymap_items.new("refboard.scale_with_images", "S", "PRESS")
         _keymaps.append((km, kmi))
 
