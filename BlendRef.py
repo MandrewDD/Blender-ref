@@ -14,9 +14,11 @@ import os
 from gpu_extras.batch import batch_for_shader
 
 _handle = None
+_keymaps = []
 NODE_HEADER_HEIGHT = 120
 NODE_SPACING = 50
 DRAW_HANDLER_TYPE = "PRE_VIEW"
+OUTLINE_WIDTH = 2.0
 
 
 # =========================================================
@@ -173,6 +175,39 @@ def get_add_image_location(context, event):
     return (loc[0] / ui_scale, loc[1] / ui_scale)
 
 
+def get_event_view_location(context, event):
+    area = getattr(context, "area", None)
+
+    if not area:
+        return None
+
+    window_region = None
+
+    for area_region in area.regions:
+        if area_region.type == "WINDOW":
+            window_region = area_region
+            break
+
+    if not window_region or not getattr(window_region, "view2d", None):
+        return None
+
+    mouse_x = event.mouse_x - window_region.x
+    mouse_y = event.mouse_y - window_region.y
+
+    if (
+        mouse_x < 0
+        or mouse_y < 0
+        or mouse_x > window_region.width
+        or mouse_y > window_region.height
+    ):
+        return None
+
+    loc = window_region.view2d.region_to_view(mouse_x, mouse_y)
+    ui_scale = get_ui_scale()
+
+    return (loc[0] / ui_scale, loc[1] / ui_scale)
+
+
 def get_view_center_location(context):
     area = getattr(context, "area", None)
 
@@ -196,6 +231,75 @@ def get_view_center_location(context):
     ui_scale = get_ui_scale()
 
     return (loc[0] / ui_scale, loc[1] / ui_scale)
+
+
+def find_image_node_at_location(tree, location):
+    x, y = location
+
+    nodes = sorted(
+        [n for n in tree.nodes if n.bl_idname == "RefBoardImageNodeType" and n.image],
+        key=lambda n: n.z_order,
+        reverse=True
+    )
+
+    for node in nodes:
+        image_width = node.image.size[0] * node.scale
+        image_height = node.image.size[1] * node.scale
+
+        if (
+            node.location.x <= x <= node.location.x + image_width
+            and node.location.y <= y <= node.location.y + image_height
+        ):
+            return node
+
+    return None
+
+
+def color_from_theme(owner, names, fallback):
+    for name in names:
+        value = getattr(owner, name, None)
+
+        if value is not None:
+            color = tuple(value)
+
+            if len(color) == 3:
+                return (color[0], color[1], color[2], 1.0)
+
+            return color
+
+    return fallback
+
+
+def get_refboard_outline_colors():
+    theme = bpy.context.preferences.themes[0].node_editor
+
+    return {
+        "normal": color_from_theme(
+            theme,
+            ("node_outline", "wire", "grid"),
+            (0.45, 0.45, 0.45, 1.0)
+        ),
+        "selected": color_from_theme(
+            theme,
+            ("node_selected", "wire_select", "selected_text"),
+            (1.0, 0.62, 0.18, 1.0)
+        ),
+        "active": color_from_theme(
+            theme,
+            ("node_active", "active_node", "node_selected"),
+            (1.0, 0.86, 0.25, 1.0)
+        ),
+    }
+
+
+def get_node_outline_color(node, active_node, colors):
+    if node == active_node and node.select:
+        return colors["active"]
+
+    if node.select:
+        return colors["selected"]
+
+    return colors["normal"]
 
 
 # =========================================================
@@ -398,6 +502,55 @@ class RB_OT_match_size(bpy.types.Operator):
 
 
 # =========================================================
+# SELECT IMAGE
+# =========================================================
+
+class RB_OT_select_image(bpy.types.Operator):
+    bl_idname = "refboard.select_image"
+    bl_label = "Select Image"
+    bl_description = "Select the RefBoard node whose image is under the cursor"
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return is_refboard_context(context)
+
+    def invoke(self, context, event):
+
+        if event.value != "PRESS":
+            return {'PASS_THROUGH'}
+
+        location = get_event_view_location(context, event)
+
+        if not location:
+            return {'PASS_THROUGH'}
+
+        tree = context.space_data.node_tree
+        node = find_image_node_at_location(tree, location)
+
+        if not node:
+            return {'PASS_THROUGH'}
+
+        if event.shift or event.ctrl:
+            node.select = not node.select
+
+            if not node.select and tree.nodes.active == node:
+                tree.nodes.active = next((n for n in tree.nodes if n.select), None)
+        else:
+            for tree_node in tree.nodes:
+                tree_node.select = False
+
+            node.select = True
+
+        if node.select:
+            tree.nodes.active = node
+
+        tag_refboard_redraw(context)
+
+        return {'FINISHED'}
+
+
+# =========================================================
 # NODE
 # =========================================================
 
@@ -460,9 +613,13 @@ def draw_callback():
     v2d = region.view2d
     ui_scale = get_ui_scale()
 
-    shader = gpu.shader.from_builtin("IMAGE_SCENE_LINEAR_TO_REC709_SRGB")
+    image_shader = gpu.shader.from_builtin("IMAGE_SCENE_LINEAR_TO_REC709_SRGB")
+    outline_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    outline_colors = get_refboard_outline_colors()
+    active_node = tree.nodes.active
     #srgb = True
     gpu.state.blend_set('ALPHA')
+    gpu.state.line_width_set(OUTLINE_WIDTH)
 
     nodes = sorted(
         [n for n in tree.nodes if n.bl_idname == "RefBoardImageNodeType" and n.image],
@@ -500,15 +657,34 @@ def draw_callback():
             (0, 1),
         )
 
-        batch = batch_for_shader(shader, "TRI_FAN", {
+        batch = batch_for_shader(image_shader, "TRI_FAN", {
             "pos": coords,
             "texCoord": uvs,
         })
 
-        shader.bind()
-        shader.uniform_sampler("image", tex)
-        batch.draw(shader)
+        image_shader.bind()
+        image_shader.uniform_sampler("image", tex)
+        batch.draw(image_shader)
 
+        outline_coords = (
+            (x1, y1),
+            (x2, y1),
+            (x2, y2),
+            (x1, y2),
+            (x1, y1),
+        )
+        outline_batch = batch_for_shader(outline_shader, "LINE_STRIP", {
+            "pos": outline_coords,
+        })
+
+        outline_shader.bind()
+        outline_shader.uniform_float(
+            "color",
+            get_node_outline_color(node, active_node, outline_colors)
+        )
+        outline_batch.draw(outline_shader)
+
+    gpu.state.line_width_set(1.0)
     gpu.state.blend_set('NONE')
 
 
@@ -697,7 +873,7 @@ class RB_PT_panel(bpy.types.Panel):
         op.mode = "GRID"
 
         box.separator()
-        box.label(text="Match Active")
+        box.label(text="Match Size")
         row = box.row(align=True)
         op = row.operator("refboard.match_size", text="Width")
         op.mode = "WIDTH"
@@ -716,6 +892,7 @@ classes = (
     RB_OT_z_adjust,
     RB_OT_align_nodes,
     RB_OT_match_size,
+    RB_OT_select_image,
     RB_OT_drop_image_node,
     RB_FH_image_drop,
     RB_OT_add_image_menu,
@@ -729,7 +906,7 @@ _handle = None
 
 def register():
 
-    global _handle
+    global _handle, _keymaps
 
     for c in classes:
         bpy.utils.register_class(c)
@@ -740,12 +917,37 @@ def register():
         draw_callback, (), "WINDOW", DRAW_HANDLER_TYPE
     )
 
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon
+
+    if kc:
+        km = kc.keymaps.new(name="Node Editor", space_type="NODE_EDITOR")
+        kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", "PRESS")
+        _keymaps.append((km, kmi))
+        kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", "PRESS", shift=True)
+        _keymaps.append((km, kmi))
+        kmi = km.keymap_items.new("refboard.select_image", "LEFTMOUSE", "PRESS", ctrl=True)
+        _keymaps.append((km, kmi))
+        kmi = km.keymap_items.new(
+            "refboard.select_image",
+            "LEFTMOUSE",
+            "PRESS",
+            shift=True,
+            ctrl=True
+        )
+        _keymaps.append((km, kmi))
+
 
 def unregister():
 
-    global _handle
+    global _handle, _keymaps
 
     bpy.types.NODE_MT_add.remove(draw_in_node_add_menu)
+
+    for km, kmi in _keymaps:
+        km.keymap_items.remove(kmi)
+
+    _keymaps.clear()
 
     if _handle:
         bpy.types.SpaceNodeEditor.draw_handler_remove(_handle, "WINDOW")
