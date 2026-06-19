@@ -1,7 +1,7 @@
 bl_info = {
     "name": "RefBoard",
     "author": "Mandrew3D <moseenkowam@gmail.com>",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 1, 0),
     "category": "Node",
 }
@@ -9,8 +9,11 @@ bl_info = {
 import bpy
 import gpu
 import gpu.texture
+import ctypes
 import math
 import os
+import struct
+import tempfile
 from gpu_extras.batch import batch_for_shader
 
 _handle = None
@@ -23,6 +26,7 @@ DRAW_HANDLER_TYPE = "PRE_VIEW"
 OUTLINE_WIDTH = 2.0
 SCALE_EPSILON = 0.0001
 CLICK_DRAG_THRESHOLD = 5
+IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".exr", ".webp"}
 
 
 # =========================================================
@@ -158,8 +162,211 @@ def load_image_for_operator(operator, filepath):
         return None
 
 
+def is_supported_image_path(filepath):
+    return os.path.splitext(filepath)[1].lower() in IMAGE_FILE_EXTENSIONS
+
+
+def get_clipboard_image_filepaths():
+    if os.name != "nt":
+        return []
+
+    user32 = ctypes.windll.user32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.CloseClipboard.restype = ctypes.c_bool
+    user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+    user32.IsClipboardFormatAvailable.restype = ctypes.c_bool
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+
+    if not user32.OpenClipboard(None):
+        return []
+
+    try:
+        paths = get_clipboard_hdrop_filepaths()
+
+        if paths:
+            return paths
+
+        return get_clipboard_dib_filepaths()
+    finally:
+        user32.CloseClipboard()
+
+
+def get_clipboard_hdrop_filepaths():
+    CF_HDROP = 15
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+    shell32.DragQueryFileW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+    ]
+    shell32.DragQueryFileW.restype = ctypes.c_uint
+
+    if not user32.IsClipboardFormatAvailable(CF_HDROP):
+        return []
+
+    handle = user32.GetClipboardData(CF_HDROP)
+
+    if not handle:
+        return []
+
+    count = shell32.DragQueryFileW(handle, 0xFFFFFFFF, None, 0)
+    paths = []
+
+    for index in range(count):
+        length = shell32.DragQueryFileW(handle, index, None, 0)
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        shell32.DragQueryFileW(handle, index, buffer, length + 1)
+        filepath = bpy.path.abspath(buffer.value)
+
+        if is_supported_image_path(filepath) and os.path.isfile(filepath):
+            paths.append(filepath)
+
+    return paths
+
+
+def get_clipboard_dib_filepaths():
+    CF_DIB = 8
+    CF_DIBV5 = 17
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+    kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
+
+    for clipboard_format in (CF_DIBV5, CF_DIB):
+        if not user32.IsClipboardFormatAvailable(clipboard_format):
+            continue
+
+        handle = user32.GetClipboardData(clipboard_format)
+
+        if not handle:
+            continue
+
+        size = kernel32.GlobalSize(handle)
+        pointer = kernel32.GlobalLock(handle)
+
+        if not pointer:
+            continue
+
+        try:
+            dib_bytes = ctypes.string_at(pointer, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+
+        filepath = save_dib_to_temp_bmp(dib_bytes)
+
+        if filepath:
+            return [filepath]
+
+    return []
+
+
+def save_dib_to_temp_bmp(dib_bytes):
+    if len(dib_bytes) < 4:
+        return None
+
+    header_size = struct.unpack_from("<I", dib_bytes, 0)[0]
+
+    if header_size < 12 or header_size > len(dib_bytes):
+        return None
+
+    color_table_size = 0
+
+    if header_size == 12 and len(dib_bytes) >= 10:
+        bit_count = struct.unpack_from("<H", dib_bytes, 10)[0]
+
+        if bit_count <= 8:
+            color_table_size = (1 << bit_count) * 3
+    elif header_size >= 40 and len(dib_bytes) >= 36:
+        bit_count = struct.unpack_from("<H", dib_bytes, 14)[0]
+        compression = struct.unpack_from("<I", dib_bytes, 16)[0]
+        colors_used = struct.unpack_from("<I", dib_bytes, 32)[0]
+
+        if colors_used:
+            color_table_size = colors_used * 4
+        elif bit_count <= 8:
+            color_table_size = (1 << bit_count) * 4
+        elif compression == 3 and header_size == 40:
+            color_table_size = 12
+
+    pixel_offset = 14 + header_size + color_table_size
+    file_size = 14 + len(dib_bytes)
+    bmp_header = b"BM" + struct.pack("<IHHI", file_size, 0, 0, pixel_offset)
+    directory = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), "refboard_clipboard")
+    os.makedirs(directory, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".bmp",
+        prefix="clipboard_",
+        dir=directory,
+        delete=False
+    ) as temp_file:
+        temp_file.write(bmp_header)
+        temp_file.write(dib_bytes)
+        return temp_file.name
+
+
+def add_image_nodes_from_paths(operator, context, paths, location, align_multiple=True):
+    tree = context.space_data.node_tree
+
+    for node in tree.nodes:
+        node.select = False
+
+    created_nodes = []
+
+    for filepath in paths:
+        img = load_image_for_operator(operator, filepath)
+
+        if not img:
+            continue
+
+        node = tree.nodes.new("RefBoardImageNodeType")
+        node.image = img
+        node.location = location
+
+        node.select = True
+        created_nodes.append(node)
+
+    if not created_nodes:
+        return []
+
+    tree.nodes.active = created_nodes[0]
+
+    if align_multiple and len(created_nodes) > 1:
+        align_nodes_row(created_nodes, created_nodes[0])
+
+    tag_refboard_redraw(context)
+
+    return created_nodes
+
+
 def update_node_draw(self, context):
     tag_refboard_redraw(context)
+
+
+def get_refboard_view_scale():
+    prefs = bpy.context.preferences
+    dpi_fac = prefs.system.dpi / 72.0
+    return dpi_fac
+
+
+def view_to_refboard_location(location):
+    scale = get_refboard_view_scale()
+
+    return (location[0] / scale, location[1] / scale)
+
+
+def refboard_to_view_location(x, y):
+    scale = get_refboard_view_scale()
+
+    return (x * scale, y * scale)
 
 
 def get_add_image_location(context, event):
@@ -196,9 +403,8 @@ def get_add_image_location(context, event):
             mouse_y = window_region.height * 0.5
 
     loc = window_region.view2d.region_to_view(mouse_x, mouse_y)
-    ui_scale = get_ui_scale()
 
-    return (loc[0] / ui_scale, loc[1] / ui_scale)
+    return view_to_refboard_location(loc)
 
 
 def get_event_view_location(context, event):
@@ -229,9 +435,8 @@ def get_event_view_location(context, event):
         return None
 
     loc = window_region.view2d.region_to_view(mouse_x, mouse_y)
-    ui_scale = get_ui_scale()
 
-    return (loc[0] / ui_scale, loc[1] / ui_scale)
+    return view_to_refboard_location(loc)
 
 
 def get_view_center_location(context):
@@ -254,9 +459,8 @@ def get_view_center_location(context):
         window_region.width * 0.5,
         window_region.height * 0.5
     )
-    ui_scale = get_ui_scale()
 
-    return (loc[0] / ui_scale, loc[1] / ui_scale)
+    return view_to_refboard_location(loc)
 
 
 def find_image_node_at_location(tree, location):
@@ -364,17 +568,6 @@ def get_scale_factor_from_mouse(pivot, start_location, current_location):
         return 1.0
 
     return max(current_distance / start_distance, SCALE_EPSILON)
-
-
-# =========================================================
-# UI SCALE
-# =========================================================
-
-def get_ui_scale():
-    prefs = bpy.context.preferences
-    dpi_fac = prefs.system.dpi / 72.0
-    ui_fac = getattr(prefs.view, "ui_scale", 1.0)
-    return dpi_fac * ui_fac
 
 
 # =========================================================
@@ -831,8 +1024,6 @@ def draw_callback():
         return
 
     v2d = region.view2d
-    ui_scale = get_ui_scale()
-
     image_shader = gpu.shader.from_builtin("IMAGE_SCENE_LINEAR_TO_REC709_SRGB")
     outline_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     outline_colors = get_refboard_outline_colors()
@@ -861,13 +1052,13 @@ def draw_callback():
             h = img.size[1] * node.scale
 
             if DRAW_HANDLER_TYPE in {"PRE_VIEW", "POST_VIEW"}:
-                x1 = node.location.x * ui_scale
-                y1 = node.location.y * ui_scale
-                x2 = (node.location.x + w) * ui_scale
-                y2 = (node.location.y + h) * ui_scale
+                x1, y1 = refboard_to_view_location(node.location.x, node.location.y)
+                x2, y2 = refboard_to_view_location(node.location.x + w, node.location.y + h)
             else:
-                x1, y1 = v2d.view_to_region(node.location.x * ui_scale, node.location.y * ui_scale, clip=False)
-                x2, y2 = v2d.view_to_region((node.location.x + w) * ui_scale, (node.location.y + h) * ui_scale, clip=False)
+                x1_view, y1_view = refboard_to_view_location(node.location.x, node.location.y)
+                x2_view, y2_view = refboard_to_view_location(node.location.x + w, node.location.y + h)
+                x1, y1 = v2d.view_to_region(x1_view, y1_view, clip=False)
+                x2, y2 = v2d.view_to_region(x2_view, y2_view, clip=False)
 
             coords = (
                 (x1, y1),
@@ -934,39 +1125,16 @@ class RB_OT_drop_image_node(bpy.types.Operator):
 
     def execute(self, context):
 
-        tree = context.space_data.node_tree
         paths = get_image_filepaths(self)
 
         if not paths:
             return {'CANCELLED'}
 
         location = get_view_center_location(context)
-
-        for node in tree.nodes:
-            node.select = False
-
-        created_nodes = []
-
-        for filepath in paths:
-            img = load_image_for_operator(self, filepath)
-
-            if not img:
-                continue
-
-            node = tree.nodes.new("RefBoardImageNodeType")
-            node.image = img
-            node.location = location
-
-            node.select = True
-            created_nodes.append(node)
+        created_nodes = add_image_nodes_from_paths(self, context, paths, location)
 
         if not created_nodes:
             return {'CANCELLED'}
-
-        tree.nodes.active = created_nodes[0]
-        align_nodes_row(created_nodes, created_nodes[0])
-
-        tag_refboard_redraw(context)
 
         return {'FINISHED'}
 
@@ -985,6 +1153,42 @@ class RB_FH_image_drop(bpy.types.FileHandler):
     @classmethod
     def poll_drop(cls, context):
         return is_refboard_context(context)
+
+
+# =========================================================
+# PASTE IMAGE
+# =========================================================
+
+class RB_OT_paste_image_node(bpy.types.Operator):
+    bl_idname = "refboard.paste_image"
+    bl_label = "Paste Image"
+    bl_description = "Paste image files or image pixels from the clipboard into the current RefBoard"
+
+    location: bpy.props.FloatVectorProperty(size=2)
+
+    @classmethod
+    def poll(cls, context):
+        return is_refboard_context(context)
+
+    def invoke(self, context, event):
+
+        self.location = get_add_image_location(context, event)
+        return self.execute(context)
+
+    def execute(self, context):
+
+        paths = get_clipboard_image_filepaths()
+
+        if not paths:
+            self.report({'INFO'}, "Clipboard does not contain image data")
+            return {'CANCELLED'}
+
+        created_nodes = add_image_nodes_from_paths(self, context, paths, self.location)
+
+        if not created_nodes:
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
 
 
 # =========================================================
@@ -1015,39 +1219,14 @@ class RB_OT_add_image_node(bpy.types.Operator):
 
     def execute(self, context):
 
-        tree = context.space_data.node_tree
         paths = get_image_filepaths(self)
 
         if not paths:
             return {'CANCELLED'}
-
-        for node in tree.nodes:
-            node.select = False
-
-        created_nodes = []
-
-        for filepath in paths:
-            img = load_image_for_operator(self, filepath)
-
-            if not img:
-                continue
-
-            node = tree.nodes.new("RefBoardImageNodeType")
-            node.image = img
-            node.location = self.location
-
-            node.select = True
-            created_nodes.append(node)
+        created_nodes = add_image_nodes_from_paths(self, context, paths, self.location)
 
         if not created_nodes:
             return {'CANCELLED'}
-
-        tree.nodes.active = created_nodes[0]
-
-        if len(created_nodes) > 1:
-            align_nodes_row(created_nodes, created_nodes[0])
-
-        tag_refboard_redraw(context)
 
         return {'FINISHED'}
 
@@ -1107,6 +1286,7 @@ class RB_PT_panel(bpy.types.Panel):
 
         layout.label(text="Images")
         layout.operator("refboard.add_image", icon="IMAGE_DATA")
+        layout.operator("refboard.paste_image", icon="PASTEDOWN")
 
         layout.separator()
 
@@ -1148,6 +1328,7 @@ classes = (
     RB_OT_scale_with_images,
     RB_OT_drop_image_node,
     RB_FH_image_drop,
+    RB_OT_paste_image_node,
     RB_OT_add_image_menu,
     RB_OT_add_image_node,
     RB_PT_panel,
@@ -1158,23 +1339,8 @@ def register():
 
     global _handle, _keymaps, _menu_added
 
-    if _handle:
-        bpy.types.SpaceNodeEditor.draw_handler_remove(_handle, "WINDOW")
-        _handle = None
-
-    for km, kmi in _keymaps:
-        try:
-            km.keymap_items.remove(kmi)
-        except RuntimeError:
-            pass
-
-    _keymaps.clear()
-
     for c in classes:
-        try:
-            bpy.utils.register_class(c)
-        except RuntimeError:
-            pass
+        bpy.utils.register_class(c)
 
     if not _menu_added:
         bpy.types.NODE_MT_add.append(draw_in_node_add_menu)
@@ -1205,6 +1371,8 @@ def register():
             )
             _keymaps.append((km, kmi))
         kmi = km.keymap_items.new("refboard.scale_with_images", "S", "PRESS")
+        _keymaps.append((km, kmi))
+        kmi = km.keymap_items.new("refboard.paste_image", "V", "PRESS", ctrl=True)
         _keymaps.append((km, kmi))
 
 
