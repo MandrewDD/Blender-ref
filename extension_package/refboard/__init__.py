@@ -17,14 +17,23 @@ import tempfile
 from gpu_extras.batch import batch_for_shader
 
 _handle = None
+_overlay_handle = None
 _keymaps = []
 _click_candidate = None
 _menu_added = False
 _image_shader = None
+_scale_overlay = None
 NODE_HEADER_HEIGHT = 120
 NODE_SPACING = 50
 DRAW_HANDLER_TYPE = "PRE_VIEW"
 OUTLINE_WIDTH = 2.0
+TRANSFORM_LINE_WIDTH = 1.0
+TRANSFORM_ARROW_WIDTH = 2.0
+TRANSFORM_DASH_LENGTH = 8.0
+TRANSFORM_DASH_GAP = 8.0
+TRANSFORM_ARROW_OFFSET = 5.0
+TRANSFORM_ARROW_LENGTH = 10.0
+TRANSFORM_ARROW_SIZE = 5.0
 SCALE_EPSILON = 0.0001
 CLICK_DRAG_THRESHOLD = 5
 IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".exr", ".webp"}
@@ -680,6 +689,95 @@ def get_node_outline_color(node, active_node, colors):
     return colors["normal"]
 
 
+def get_transform_line_color():
+    theme = bpy.context.preferences.themes[0]
+
+    for owner_name in ("node_editor", "view_3d"):
+        owner = getattr(theme, owner_name, None)
+
+        if owner:
+            return color_from_theme(
+                owner,
+                ("view_overlay", "transform", "grid"),
+                (0.8, 0.8, 0.8, 1.0)
+            )
+
+    return (0.8, 0.8, 0.8, 1.0)
+
+
+def make_dashed_line(start, end, dash_length, dash_gap):
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+
+    if length <= 0.0:
+        return []
+
+    coords = []
+    distance = 0.0
+
+    while distance < length:
+        segment_end = min(distance + dash_length, length)
+        start_factor = distance / length
+        end_factor = segment_end / length
+        dash_start = (
+            start[0] + dx * start_factor,
+            start[1] + dy * start_factor
+        )
+        dash_end = (
+            start[0] + dx * end_factor,
+            start[1] + dy * end_factor
+        )
+        coords.extend((dash_start, dash_end))
+        distance += dash_length + dash_gap
+
+    return coords
+
+
+def make_transform_arrow(center, angle, direction):
+    offset = TRANSFORM_ARROW_OFFSET * direction
+    length = TRANSFORM_ARROW_LENGTH * direction
+    size = TRANSFORM_ARROW_SIZE * direction
+    axis = (math.cos(angle), math.sin(angle))
+    perp = (-axis[1], axis[0])
+
+    base = (
+        center[0] + axis[0] * offset,
+        center[1] + axis[1] * offset
+    )
+    tip = (
+        center[0] + axis[0] * (offset + length),
+        center[1] + axis[1] * (offset + length)
+    )
+    wing_center = (
+        center[0] + axis[0] * (offset + length - size),
+        center[1] + axis[1] * (offset + length - size)
+    )
+    wing_a = (
+        wing_center[0] + perp[0] * abs(size),
+        wing_center[1] + perp[1] * abs(size)
+    )
+    wing_b = (
+        wing_center[0] - perp[0] * abs(size),
+        wing_center[1] - perp[1] * abs(size)
+    )
+
+    return (base, tip, tip, wing_a, tip, wing_b)
+
+
+def draw_line_coords(coords, width):
+    if not coords:
+        return
+
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "LINES", {"pos": coords})
+
+    gpu.state.line_width_set(width)
+    shader.bind()
+    shader.uniform_float("color", get_transform_line_color())
+    batch.draw(shader)
+
+
 def get_image_shader():
     global _image_shader
 
@@ -702,6 +800,66 @@ def get_image_shader():
         _image_shader = gpu.shader.from_builtin("IMAGE")
 
     return _image_shader
+
+
+def draw_scale_overlay():
+    if not _scale_overlay:
+        return
+
+    region = bpy.context.region
+
+    if not region or not getattr(region, "view2d", None):
+        return
+
+    pivot = _scale_overlay.get("pivot")
+    current = _scale_overlay.get("current")
+
+    if not pivot or not current:
+        return
+
+    start_view = refboard_to_view_location(pivot[0], pivot[1])
+    end_view = refboard_to_view_location(current[0], current[1])
+    start_region = region.view2d.view_to_region(start_view[0], start_view[1], clip=False)
+    end_region = region.view2d.view_to_region(end_view[0], end_view[1], clip=False)
+    line_coords = make_dashed_line(
+        start_region,
+        end_region,
+        TRANSFORM_DASH_LENGTH,
+        TRANSFORM_DASH_GAP
+    )
+    draw_line_coords(line_coords, TRANSFORM_LINE_WIDTH)
+
+    dx = end_region[0] - start_region[0]
+    dy = end_region[1] - start_region[1]
+
+    if dx == 0.0 and dy == 0.0:
+        return
+
+    angle = math.atan2(dy, dx)
+    arrow_coords = []
+    arrow_coords.extend(make_transform_arrow(end_region, angle, 1.0))
+    arrow_coords.extend(make_transform_arrow(end_region, angle, -1.0))
+    draw_line_coords(arrow_coords, TRANSFORM_ARROW_WIDTH)
+
+
+def draw_scale_overlay_callback():
+    space = bpy.context.space_data
+
+    if (
+        not space
+        or space.type != "NODE_EDITOR"
+        or not space.node_tree
+        or space.node_tree.bl_idname != "RefBoardTreeType"
+    ):
+        return
+
+    gpu.state.blend_set('ALPHA')
+
+    try:
+        draw_scale_overlay()
+    finally:
+        gpu.state.line_width_set(1.0)
+        gpu.state.blend_set('NONE')
 
 
 def get_selection_center(nodes):
@@ -1196,8 +1354,43 @@ class RB_OT_scale_with_images(bpy.types.Operator):
         if context.area:
             context.area.header_text_set(None)
 
+    def update_overlay(self, context):
+        global _scale_overlay
+
+        _scale_overlay = {
+            "pivot": self._pivot,
+            "current": self._current_mouse_location,
+        }
+        tag_refboard_redraw(context)
+
+    def clear_overlay(self, context):
+        global _scale_overlay
+
+        _scale_overlay = None
+        tag_refboard_redraw(context)
+
+    def set_cursor(self, context):
+        for cursor in ("NONE", "CROSSHAIR"):
+            try:
+                context.window.cursor_modal_set(cursor)
+                return
+            except Exception:
+                continue
+
+    def restore_cursor(self, context):
+        try:
+            context.window.cursor_modal_restore()
+        except Exception:
+            pass
+
+    def clear_transform_ui(self, context):
+        self.clear_header(context)
+        self.restore_cursor(context)
+        self.clear_overlay(context)
+
     def refresh_transform(self, context):
         self.apply_scale(context, self.get_current_factor(), self._axis)
+        self.update_overlay(context)
         self.update_header(context)
 
     def apply_scale(self, context, factor, axis=None):
@@ -1230,6 +1423,7 @@ class RB_OT_scale_with_images(bpy.types.Operator):
         else:
             self._axis = axis
 
+        self.set_cursor(context)
         self.refresh_transform(context)
 
     def append_numeric_input(self, context, text):
@@ -1300,13 +1494,15 @@ class RB_OT_scale_with_images(bpy.types.Operator):
             return {'CANCELLED'}
 
         context.window_manager.modal_handler_add(self)
+        self.set_cursor(context)
+        self.update_overlay(context)
         self.update_header(context)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
 
         if not is_refboard_context(context):
-            self.clear_header(context)
+            self.clear_transform_ui(context)
             return {'CANCELLED'}
 
         if event.type == 'MOUSEMOVE':
@@ -1320,7 +1516,7 @@ class RB_OT_scale_with_images(bpy.types.Operator):
 
         elif event.type in {'ESC', 'RIGHTMOUSE'}:
             self.restore_transform(context)
-            self.clear_header(context)
+            self.clear_transform_ui(context)
             return {'CANCELLED'}
 
         elif event.value == "PRESS" and event.type in {"X", "Y"}:
@@ -1339,7 +1535,7 @@ class RB_OT_scale_with_images(bpy.types.Operator):
             event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'}
             and event.value == 'RELEASE'
         ):
-            self.clear_header(context)
+            self.clear_transform_ui(context)
             return {'FINISHED'}
 
         return {'RUNNING_MODAL'}
@@ -1482,6 +1678,7 @@ def draw_callback():
                 get_node_outline_color(node, active_node, outline_colors)
             )
             outline_batch.draw(outline_shader)
+
     finally:
         gpu.state.line_width_set(1.0)
         gpu.state.blend_set('NONE')
@@ -1751,7 +1948,7 @@ classes = (
 
 def register():
 
-    global _handle, _keymaps, _menu_added
+    global _handle, _overlay_handle, _keymaps, _menu_added
 
     for c in classes:
         bpy.utils.register_class(c)
@@ -1762,6 +1959,9 @@ def register():
 
     _handle = bpy.types.SpaceNodeEditor.draw_handler_add(
         draw_callback, (), "WINDOW", DRAW_HANDLER_TYPE
+    )
+    _overlay_handle = bpy.types.SpaceNodeEditor.draw_handler_add(
+        draw_scale_overlay_callback, (), "WINDOW", "POST_PIXEL"
     )
 
     wm = bpy.context.window_manager
@@ -1792,7 +1992,7 @@ def register():
 
 def unregister():
 
-    global _handle, _keymaps, _menu_added
+    global _handle, _overlay_handle, _keymaps, _menu_added, _scale_overlay
 
     if _menu_added:
         try:
@@ -1817,6 +2017,16 @@ def unregister():
             pass
 
         _handle = None
+
+    if _overlay_handle:
+        try:
+            bpy.types.SpaceNodeEditor.draw_handler_remove(_overlay_handle, "WINDOW")
+        except (ReferenceError, RuntimeError):
+            pass
+
+        _overlay_handle = None
+
+    _scale_overlay = None
 
     for c in reversed(classes):
         try:
