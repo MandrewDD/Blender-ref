@@ -8,6 +8,7 @@
 - Added Blender-like numeric input and X/Y axis constraints to RefBoard image scaling; axis-constrained scaling moves nodes without resizing images.
 - Added active-node alignment buttons for image top/middle/node bottom and image left/center/right.
 - Made Shift-click selection follow Blender behavior: selected inactive images become active before they can be deselected.
+- Moved Match Size controls to the top of the Arrange panel section.
 
 ## 1.2.1
 

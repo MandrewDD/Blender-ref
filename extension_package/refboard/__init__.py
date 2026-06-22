@@ -1617,20 +1617,30 @@ class RB_PT_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Arrange")
 
+        box.label(text="Match Size")
+        row = box.row(align=True)
+        op = row.operator("refboard.match_size", text="Width")
+        op.mode = "WIDTH"
+
+        op = row.operator("refboard.match_size", text="Height")
+        op.mode = "HEIGHT"
+
+        box.separator()
         box.label(text="Layout")
         row = box.row(align=True)
-        op = row.operator("refboard.align_nodes", text="Row")
+        op = row.operator("refboard.align_nodes", text="Row", icon="RIGHTARROW")
         op.mode = "ROW"
 
-        op = row.operator("refboard.align_nodes", text="Column")
+        op = row.operator("refboard.align_nodes", text="Column", icon="DOWNARROW_HLT")
         op.mode = "COL"
 
-        op = row.operator("refboard.align_nodes", text="Grid")
+        op = row.operator("refboard.align_nodes", text="Grid", icon="SNAP_VERTEX")
         op.mode = "GRID"
 
         box.separator()
         box.label(text="Align")
         row = box.row(align=True)
+        row.label(text="", icon="SPLIT_HORIZONTAL")
         op = row.operator("refboard.align_to_active", text="Top")
         op.mode = "H_TOP"
 
@@ -1641,6 +1651,7 @@ class RB_PT_panel(bpy.types.Panel):
         op.mode = "H_BOTTOM"
 
         row = box.row(align=True)
+        row.label(text="", icon="SPLIT_VERTICAL")
         op = row.operator("refboard.align_to_active", text="Left")
         op.mode = "V_LEFT"
 
@@ -1649,15 +1660,6 @@ class RB_PT_panel(bpy.types.Panel):
 
         op = row.operator("refboard.align_to_active", text="Right")
         op.mode = "V_RIGHT"
-
-        box.separator()
-        box.label(text="Match Size")
-        row = box.row(align=True)
-        op = row.operator("refboard.match_size", text="Width")
-        op.mode = "WIDTH"
-
-        op = row.operator("refboard.match_size", text="Height")
-        op.mode = "HEIGHT"
 
 
 # =========================================================
