@@ -4,6 +4,10 @@
 
 - Added Ctrl+V image paste support in RefBoard.
 - Supports pasted image files and direct bitmap image data from the clipboard.
+- Packs direct clipboard bitmap images into the `.blend` file instead of keeping them linked to temporary files.
+- Added Blender-like numeric input and X/Y axis constraints to RefBoard image scaling; axis-constrained scaling moves nodes without resizing images.
+- Added active-node alignment buttons for image top/middle/node bottom and image left/center/right.
+- Made Shift-click selection follow Blender behavior: selected inactive images become active before they can be deselected.
 
 ## 1.2.1
 
