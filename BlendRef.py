@@ -1,7 +1,7 @@
 bl_info = {
     "name": "RefBoard",
     "author": "Mandrew3D <moseenkowam@gmail.com>",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 1, 0),
     "category": "Node",
 }
@@ -9,8 +9,11 @@ bl_info = {
 import bpy
 import gpu
 import gpu.texture
+import ctypes
 import math
 import os
+import struct
+import tempfile
 from gpu_extras.batch import batch_for_shader
 
 _handle = None
@@ -23,6 +26,29 @@ DRAW_HANDLER_TYPE = "PRE_VIEW"
 OUTLINE_WIDTH = 2.0
 SCALE_EPSILON = 0.0001
 CLICK_DRAG_THRESHOLD = 5
+IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".exr", ".webp"}
+NUMERIC_INPUT_KEYS = {
+    "ZERO": "0",
+    "ONE": "1",
+    "TWO": "2",
+    "THREE": "3",
+    "FOUR": "4",
+    "FIVE": "5",
+    "SIX": "6",
+    "SEVEN": "7",
+    "EIGHT": "8",
+    "NINE": "9",
+    "NUMPAD_0": "0",
+    "NUMPAD_1": "1",
+    "NUMPAD_2": "2",
+    "NUMPAD_3": "3",
+    "NUMPAD_4": "4",
+    "NUMPAD_5": "5",
+    "NUMPAD_6": "6",
+    "NUMPAD_7": "7",
+    "NUMPAD_8": "8",
+    "NUMPAD_9": "9",
+}
 
 
 # =========================================================
@@ -122,6 +148,61 @@ def align_nodes_grid(nodes, active):
         n.location.y = start_y - row * cell_height
 
 
+def get_node_image_width(node):
+    return node.image.size[0] * node.scale
+
+
+def get_node_image_height(node):
+    return node.image.size[1] * node.scale
+
+
+def align_nodes_to_active(nodes, active, mode):
+    if not nodes:
+        return
+
+    if active not in nodes:
+        active = nodes[0]
+
+    active_width = get_node_image_width(active)
+    active_height = get_node_image_height(active)
+
+    if mode == "H_TOP":
+        target = active.location.y + active_height
+
+        for n in nodes:
+            n.location.y = target - get_node_image_height(n)
+
+    elif mode == "H_CENTER":
+        target = active.location.y + active_height * 0.5
+
+        for n in nodes:
+            n.location.y = target - get_node_image_height(n) * 0.5
+
+    elif mode == "H_BOTTOM":
+        target = active.location.y - NODE_HEADER_HEIGHT
+
+        for n in nodes:
+            n.location.y = target + NODE_HEADER_HEIGHT
+
+    elif mode == "V_LEFT":
+        target = active.location.x
+
+        for n in nodes:
+            n.location.x = target
+
+    elif mode == "V_CENTER":
+        target = active.location.x + active_width * 0.5
+
+        for n in nodes:
+            n.location.x = target - get_node_image_width(n) * 0.5
+
+    elif mode == "V_RIGHT":
+        target = active.location.x + active_width
+
+        for n in nodes:
+            n.location.x = target - get_node_image_width(n)
+
+
 def tag_refboard_redraw(context):
     screen = getattr(context, "screen", None)
     area = getattr(context, "area", None)
@@ -149,17 +230,250 @@ def get_image_filepaths(operator):
     return []
 
 
-def load_image_for_operator(operator, filepath):
+def load_image_for_operator(operator, filepath, pack_image=False, cleanup_file=False):
     try:
-        return bpy.data.images.load(filepath, check_existing=True)
+        image = bpy.data.images.load(filepath, check_existing=True)
     except RuntimeError as exc:
         operator.report({'WARNING'}, f"Could not load image: {filepath}")
         print(f"RefBoard: could not load image {filepath!r}: {exc}")
         return None
 
+    if pack_image:
+        try:
+            image.pack()
+        except RuntimeError as exc:
+            operator.report({'WARNING'}, f"Could not pack image: {filepath}")
+            print(f"RefBoard: could not pack image {filepath!r}: {exc}")
+        else:
+            image.name = "Clipboard Image"
+
+            if cleanup_file:
+                try:
+                    os.remove(filepath)
+                except OSError as exc:
+                    print(f"RefBoard: could not remove clipboard temp file {filepath!r}: {exc}")
+
+    return image
+
+
+def is_supported_image_path(filepath):
+    return os.path.splitext(filepath)[1].lower() in IMAGE_FILE_EXTENSIONS
+
+
+def get_clipboard_image_filepaths():
+    if os.name != "nt":
+        return [], False
+
+    user32 = ctypes.windll.user32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.CloseClipboard.restype = ctypes.c_bool
+    user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+    user32.IsClipboardFormatAvailable.restype = ctypes.c_bool
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+
+    if not user32.OpenClipboard(None):
+        return [], False
+
+    try:
+        paths = get_clipboard_hdrop_filepaths()
+
+        if paths:
+            return paths, False
+
+        return get_clipboard_dib_filepaths(), True
+    finally:
+        user32.CloseClipboard()
+
+
+def get_clipboard_hdrop_filepaths():
+    CF_HDROP = 15
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+    shell32.DragQueryFileW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+    ]
+    shell32.DragQueryFileW.restype = ctypes.c_uint
+
+    if not user32.IsClipboardFormatAvailable(CF_HDROP):
+        return []
+
+    handle = user32.GetClipboardData(CF_HDROP)
+
+    if not handle:
+        return []
+
+    count = shell32.DragQueryFileW(handle, 0xFFFFFFFF, None, 0)
+    paths = []
+
+    for index in range(count):
+        length = shell32.DragQueryFileW(handle, index, None, 0)
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        shell32.DragQueryFileW(handle, index, buffer, length + 1)
+        filepath = bpy.path.abspath(buffer.value)
+
+        if is_supported_image_path(filepath) and os.path.isfile(filepath):
+            paths.append(filepath)
+
+    return paths
+
+
+def get_clipboard_dib_filepaths():
+    CF_DIB = 8
+    CF_DIBV5 = 17
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+    kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
+
+    for clipboard_format in (CF_DIBV5, CF_DIB):
+        if not user32.IsClipboardFormatAvailable(clipboard_format):
+            continue
+
+        handle = user32.GetClipboardData(clipboard_format)
+
+        if not handle:
+            continue
+
+        size = kernel32.GlobalSize(handle)
+        pointer = kernel32.GlobalLock(handle)
+
+        if not pointer:
+            continue
+
+        try:
+            dib_bytes = ctypes.string_at(pointer, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+
+        filepath = save_dib_to_temp_bmp(dib_bytes)
+
+        if filepath:
+            return [filepath]
+
+    return []
+
+
+def save_dib_to_temp_bmp(dib_bytes):
+    if len(dib_bytes) < 4:
+        return None
+
+    header_size = struct.unpack_from("<I", dib_bytes, 0)[0]
+
+    if header_size < 12 or header_size > len(dib_bytes):
+        return None
+
+    color_table_size = 0
+
+    if header_size == 12 and len(dib_bytes) >= 10:
+        bit_count = struct.unpack_from("<H", dib_bytes, 10)[0]
+
+        if bit_count <= 8:
+            color_table_size = (1 << bit_count) * 3
+    elif header_size >= 40 and len(dib_bytes) >= 36:
+        bit_count = struct.unpack_from("<H", dib_bytes, 14)[0]
+        compression = struct.unpack_from("<I", dib_bytes, 16)[0]
+        colors_used = struct.unpack_from("<I", dib_bytes, 32)[0]
+
+        if colors_used:
+            color_table_size = colors_used * 4
+        elif bit_count <= 8:
+            color_table_size = (1 << bit_count) * 4
+        elif compression == 3 and header_size == 40:
+            color_table_size = 12
+
+    pixel_offset = 14 + header_size + color_table_size
+    file_size = 14 + len(dib_bytes)
+    bmp_header = b"BM" + struct.pack("<IHHI", file_size, 0, 0, pixel_offset)
+    directory = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), "refboard_clipboard")
+    os.makedirs(directory, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".bmp",
+        prefix="clipboard_",
+        dir=directory,
+        delete=False
+    ) as temp_file:
+        temp_file.write(bmp_header)
+        temp_file.write(dib_bytes)
+        return temp_file.name
+
+
+def add_image_nodes_from_paths(
+    operator,
+    context,
+    paths,
+    location,
+    align_multiple=True,
+    pack_images=False,
+    cleanup_files=False
+):
+    tree = context.space_data.node_tree
+
+    for node in tree.nodes:
+        node.select = False
+
+    created_nodes = []
+
+    for filepath in paths:
+        img = load_image_for_operator(
+            operator,
+            filepath,
+            pack_image=pack_images,
+            cleanup_file=cleanup_files
+        )
+
+        if not img:
+            continue
+
+        node = tree.nodes.new("RefBoardImageNodeType")
+        node.image = img
+        node.location = location
+
+        node.select = True
+        created_nodes.append(node)
+
+    if not created_nodes:
+        return []
+
+    tree.nodes.active = created_nodes[0]
+
+    if align_multiple and len(created_nodes) > 1:
+        align_nodes_row(created_nodes, created_nodes[0])
+
+    tag_refboard_redraw(context)
+
+    return created_nodes
+
 
 def update_node_draw(self, context):
     tag_refboard_redraw(context)
+
+
+def get_refboard_view_scale():
+    prefs = bpy.context.preferences
+    dpi_fac = prefs.system.dpi / 72.0
+    return dpi_fac
+
+
+def view_to_refboard_location(location):
+    scale = get_refboard_view_scale()
+
+    return (location[0] / scale, location[1] / scale)
+
+
+def refboard_to_view_location(x, y):
+    scale = get_refboard_view_scale()
+
+    return (x * scale, y * scale)
 
 
 def get_add_image_location(context, event):
@@ -196,9 +510,8 @@ def get_add_image_location(context, event):
             mouse_y = window_region.height * 0.5
 
     loc = window_region.view2d.region_to_view(mouse_x, mouse_y)
-    ui_scale = get_ui_scale()
 
-    return (loc[0] / ui_scale, loc[1] / ui_scale)
+    return view_to_refboard_location(loc)
 
 
 def get_event_view_location(context, event):
@@ -229,9 +542,8 @@ def get_event_view_location(context, event):
         return None
 
     loc = window_region.view2d.region_to_view(mouse_x, mouse_y)
-    ui_scale = get_ui_scale()
 
-    return (loc[0] / ui_scale, loc[1] / ui_scale)
+    return view_to_refboard_location(loc)
 
 
 def get_view_center_location(context):
@@ -254,9 +566,8 @@ def get_view_center_location(context):
         window_region.width * 0.5,
         window_region.height * 0.5
     )
-    ui_scale = get_ui_scale()
 
-    return (loc[0] / ui_scale, loc[1] / ui_scale)
+    return view_to_refboard_location(loc)
 
 
 def find_image_node_at_location(tree, location):
@@ -366,15 +677,44 @@ def get_scale_factor_from_mouse(pivot, start_location, current_location):
     return max(current_distance / start_distance, SCALE_EPSILON)
 
 
-# =========================================================
-# UI SCALE
-# =========================================================
+def get_axis_scale_factor_from_mouse(pivot, start_location, current_location, axis):
+    if axis == "X":
+        axis_index = 0
+    elif axis == "Y":
+        axis_index = 1
+    else:
+        return get_scale_factor_from_mouse(pivot, start_location, current_location)
 
-def get_ui_scale():
-    prefs = bpy.context.preferences
-    dpi_fac = prefs.system.dpi / 72.0
-    ui_fac = getattr(prefs.view, "ui_scale", 1.0)
-    return dpi_fac * ui_fac
+    start_distance = abs(start_location[axis_index] - pivot[axis_index])
+    current_distance = abs(current_location[axis_index] - pivot[axis_index])
+
+    if start_distance <= SCALE_EPSILON:
+        return 1.0
+
+    return max(current_distance / start_distance, SCALE_EPSILON)
+
+
+def parse_scale_numeric_input(text):
+    if text in {"", "-", ".", "-."}:
+        return None
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def get_numeric_input_text(event):
+    if event.type in NUMERIC_INPUT_KEYS:
+        return NUMERIC_INPUT_KEYS[event.type]
+
+    if event.type in {"PERIOD", "NUMPAD_PERIOD", "COMMA"}:
+        return "."
+
+    if event.type in {"MINUS", "NUMPAD_MINUS"}:
+        return "-"
+
+    return None
 
 
 # =========================================================
@@ -501,6 +841,54 @@ class RB_OT_align_nodes(bpy.types.Operator):
 
 
 # =========================================================
+# ALIGN TO ACTIVE
+# =========================================================
+
+class RB_OT_align_to_active(bpy.types.Operator):
+    bl_idname = "refboard.align_to_active"
+    bl_label = "Align"
+    bl_description = "Align selected RefBoard image nodes to the active image node"
+
+    mode: bpy.props.StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return is_refboard_context(context)
+
+    @classmethod
+    def description(cls, context, properties):
+        descriptions = {
+            "H_TOP": "Align selected images by the active image top edge",
+            "H_CENTER": "Align selected images by the active image vertical center",
+            "H_BOTTOM": "Align selected nodes by the active node bottom edge",
+            "V_LEFT": "Align selected images by the active image left edge",
+            "V_CENTER": "Align selected images by the active image horizontal center",
+            "V_RIGHT": "Align selected images by the active image right edge",
+        }
+
+        return descriptions.get(properties.mode, cls.bl_description)
+
+    def execute(self, context):
+
+        tree = context.space_data.node_tree
+        active = tree.nodes.active
+        nodes = [
+            n for n in tree.nodes
+            if n.bl_idname == "RefBoardImageNodeType"
+            and n.image
+            and n.select
+        ]
+
+        if not nodes:
+            return {'CANCELLED'}
+
+        align_nodes_to_active(nodes, active, self.mode)
+        tag_refboard_redraw(context)
+
+        return {'FINISHED'}
+
+
+# =========================================================
 # MATCH SIZE
 # =========================================================
 
@@ -590,7 +978,19 @@ class RB_OT_select_image(bpy.types.Operator):
         if not node:
             return {'CANCELLED'}
 
-        if self._shift or self._ctrl:
+        if self._shift:
+            if node.select and tree.nodes.active != node:
+                tree.nodes.active = node
+            elif node.select:
+                node.select = False
+
+                if tree.nodes.active == node:
+                    tree.nodes.active = next((n for n in tree.nodes if n.select), None)
+            else:
+                node.select = True
+                tree.nodes.active = node
+
+        elif self._ctrl:
             node.select = not node.select
 
             if not node.select and tree.nodes.active == node:
@@ -674,6 +1074,10 @@ class RB_OT_scale_with_images(bpy.types.Operator):
     _initial_scales = None
     _pivot = None
     _start_mouse_location = None
+    _current_mouse_location = None
+    _axis = None
+    _numeric_input = ""
+    _numeric_factor = None
 
     @classmethod
     def poll(cls, context):
@@ -690,19 +1094,104 @@ class RB_OT_scale_with_images(bpy.types.Operator):
             and tree.nodes[name].image
         ]
 
-    def apply_scale(self, context, factor):
+    def get_current_factor(self):
+        if self._numeric_input:
+            if self._numeric_factor is not None:
+                return self._numeric_factor
+
+            return 1.0
+
+        if not self._current_mouse_location:
+            return 1.0
+
+        return get_axis_scale_factor_from_mouse(
+            self._pivot,
+            self._start_mouse_location,
+            self._current_mouse_location,
+            self._axis
+        )
+
+    def update_header(self, context):
+        if not context.area:
+            return
+
+        axis_text = self._axis if self._axis else "free"
+
+        if self._numeric_input:
+            value_text = self._numeric_input
+        else:
+            value_text = f"{self.get_current_factor():.4g}"
+
+        context.area.header_text_set(
+            f"Scale Images: {value_text}  Axis: {axis_text}  "
+            "Confirm: Enter/Space/LMB, Cancel: Esc/RMB"
+        )
+
+    def clear_header(self, context):
+        if context.area:
+            context.area.header_text_set(None)
+
+    def refresh_transform(self, context):
+        self.apply_scale(context, self.get_current_factor(), self._axis)
+        self.update_header(context)
+
+    def apply_scale(self, context, factor, axis=None):
         nodes = self.get_nodes(context)
 
         for node in nodes:
             initial_location = self._initial_locations[node.name]
 
             if len(nodes) > 1:
-                node.location.x = self._pivot[0] + (initial_location[0] - self._pivot[0]) * factor
-                node.location.y = self._pivot[1] + (initial_location[1] - self._pivot[1]) * factor
+                if axis in {None, "X"}:
+                    node.location.x = self._pivot[0] + (initial_location[0] - self._pivot[0]) * factor
+                else:
+                    node.location.x = initial_location[0]
 
-            node.scale = self._initial_scales[node.name] * factor
+                if axis in {None, "Y"}:
+                    node.location.y = self._pivot[1] + (initial_location[1] - self._pivot[1]) * factor
+                else:
+                    node.location.y = initial_location[1]
+
+            if axis is None:
+                node.scale = self._initial_scales[node.name] * factor
+            else:
+                node.scale = self._initial_scales[node.name]
 
         tag_refboard_redraw(context)
+
+    def set_axis(self, context, axis):
+        if self._axis == axis:
+            self._axis = None
+        else:
+            self._axis = axis
+
+        self.refresh_transform(context)
+
+    def append_numeric_input(self, context, text):
+        if text == "-":
+            if self._numeric_input.startswith("-"):
+                self._numeric_input = self._numeric_input[1:]
+            else:
+                self._numeric_input = "-" + self._numeric_input
+        elif text == ".":
+            if "." not in self._numeric_input:
+                if self._numeric_input in {"", "-"}:
+                    self._numeric_input += "0"
+
+                self._numeric_input += "."
+        else:
+            self._numeric_input += text
+
+        self._numeric_factor = parse_scale_numeric_input(self._numeric_input)
+        self.refresh_transform(context)
+
+    def remove_numeric_input(self, context):
+        if not self._numeric_input:
+            return
+
+        self._numeric_input = self._numeric_input[:-1]
+        self._numeric_factor = parse_scale_numeric_input(self._numeric_input)
+        self.refresh_transform(context)
 
     def restore_transform(self, context):
         for node in self.get_nodes(context):
@@ -737,35 +1226,56 @@ class RB_OT_scale_with_images(bpy.types.Operator):
         }
         self._pivot = get_scale_pivot(nodes)
         self._start_mouse_location = get_event_view_location(context, event)
+        self._current_mouse_location = self._start_mouse_location
+        self._axis = None
+        self._numeric_input = ""
+        self._numeric_factor = None
 
         if not self._start_mouse_location:
             return {'CANCELLED'}
 
         context.window_manager.modal_handler_add(self)
+        self.update_header(context)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
 
         if not is_refboard_context(context):
+            self.clear_header(context)
             return {'CANCELLED'}
 
         if event.type == 'MOUSEMOVE':
             current_location = get_event_view_location(context, event)
 
             if current_location:
-                factor = get_scale_factor_from_mouse(
-                    self._pivot,
-                    self._start_mouse_location,
-                    current_location
-                )
-                self.apply_scale(context, factor)
+                self._current_mouse_location = current_location
 
-        elif event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'RELEASE':
-            return {'FINISHED'}
+                if self._numeric_factor is None:
+                    self.refresh_transform(context)
 
         elif event.type in {'ESC', 'RIGHTMOUSE'}:
             self.restore_transform(context)
+            self.clear_header(context)
             return {'CANCELLED'}
+
+        elif event.value == "PRESS" and event.type in {"X", "Y"}:
+            self.set_axis(context, event.type)
+
+        elif event.value == "PRESS" and event.type == "BACK_SPACE":
+            self.remove_numeric_input(context)
+
+        elif event.value == "PRESS":
+            text = get_numeric_input_text(event)
+
+            if text:
+                self.append_numeric_input(context, text)
+
+        elif (
+            event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'}
+            and event.value == 'RELEASE'
+        ):
+            self.clear_header(context)
+            return {'FINISHED'}
 
         return {'RUNNING_MODAL'}
 
@@ -831,8 +1341,6 @@ def draw_callback():
         return
 
     v2d = region.view2d
-    ui_scale = get_ui_scale()
-
     image_shader = gpu.shader.from_builtin("IMAGE_SCENE_LINEAR_TO_REC709_SRGB")
     outline_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     outline_colors = get_refboard_outline_colors()
@@ -861,13 +1369,13 @@ def draw_callback():
             h = img.size[1] * node.scale
 
             if DRAW_HANDLER_TYPE in {"PRE_VIEW", "POST_VIEW"}:
-                x1 = node.location.x * ui_scale
-                y1 = node.location.y * ui_scale
-                x2 = (node.location.x + w) * ui_scale
-                y2 = (node.location.y + h) * ui_scale
+                x1, y1 = refboard_to_view_location(node.location.x, node.location.y)
+                x2, y2 = refboard_to_view_location(node.location.x + w, node.location.y + h)
             else:
-                x1, y1 = v2d.view_to_region(node.location.x * ui_scale, node.location.y * ui_scale, clip=False)
-                x2, y2 = v2d.view_to_region((node.location.x + w) * ui_scale, (node.location.y + h) * ui_scale, clip=False)
+                x1_view, y1_view = refboard_to_view_location(node.location.x, node.location.y)
+                x2_view, y2_view = refboard_to_view_location(node.location.x + w, node.location.y + h)
+                x1, y1 = v2d.view_to_region(x1_view, y1_view, clip=False)
+                x2, y2 = v2d.view_to_region(x2_view, y2_view, clip=False)
 
             coords = (
                 (x1, y1),
@@ -934,39 +1442,16 @@ class RB_OT_drop_image_node(bpy.types.Operator):
 
     def execute(self, context):
 
-        tree = context.space_data.node_tree
         paths = get_image_filepaths(self)
 
         if not paths:
             return {'CANCELLED'}
 
         location = get_view_center_location(context)
-
-        for node in tree.nodes:
-            node.select = False
-
-        created_nodes = []
-
-        for filepath in paths:
-            img = load_image_for_operator(self, filepath)
-
-            if not img:
-                continue
-
-            node = tree.nodes.new("RefBoardImageNodeType")
-            node.image = img
-            node.location = location
-
-            node.select = True
-            created_nodes.append(node)
+        created_nodes = add_image_nodes_from_paths(self, context, paths, location)
 
         if not created_nodes:
             return {'CANCELLED'}
-
-        tree.nodes.active = created_nodes[0]
-        align_nodes_row(created_nodes, created_nodes[0])
-
-        tag_refboard_redraw(context)
 
         return {'FINISHED'}
 
@@ -985,6 +1470,49 @@ class RB_FH_image_drop(bpy.types.FileHandler):
     @classmethod
     def poll_drop(cls, context):
         return is_refboard_context(context)
+
+
+# =========================================================
+# PASTE IMAGE
+# =========================================================
+
+class RB_OT_paste_image_node(bpy.types.Operator):
+    bl_idname = "refboard.paste_image"
+    bl_label = "Paste Image"
+    bl_description = "Paste image files or image pixels from the clipboard into the current RefBoard"
+
+    location: bpy.props.FloatVectorProperty(size=2)
+
+    @classmethod
+    def poll(cls, context):
+        return is_refboard_context(context)
+
+    def invoke(self, context, event):
+
+        self.location = get_add_image_location(context, event)
+        return self.execute(context)
+
+    def execute(self, context):
+
+        paths, pack_clipboard_images = get_clipboard_image_filepaths()
+
+        if not paths:
+            self.report({'INFO'}, "Clipboard does not contain image data")
+            return {'CANCELLED'}
+
+        created_nodes = add_image_nodes_from_paths(
+            self,
+            context,
+            paths,
+            self.location,
+            pack_images=pack_clipboard_images,
+            cleanup_files=pack_clipboard_images
+        )
+
+        if not created_nodes:
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
 
 
 # =========================================================
@@ -1015,39 +1543,14 @@ class RB_OT_add_image_node(bpy.types.Operator):
 
     def execute(self, context):
 
-        tree = context.space_data.node_tree
         paths = get_image_filepaths(self)
 
         if not paths:
             return {'CANCELLED'}
-
-        for node in tree.nodes:
-            node.select = False
-
-        created_nodes = []
-
-        for filepath in paths:
-            img = load_image_for_operator(self, filepath)
-
-            if not img:
-                continue
-
-            node = tree.nodes.new("RefBoardImageNodeType")
-            node.image = img
-            node.location = self.location
-
-            node.select = True
-            created_nodes.append(node)
+        created_nodes = add_image_nodes_from_paths(self, context, paths, self.location)
 
         if not created_nodes:
             return {'CANCELLED'}
-
-        tree.nodes.active = created_nodes[0]
-
-        if len(created_nodes) > 1:
-            align_nodes_row(created_nodes, created_nodes[0])
-
-        tag_refboard_redraw(context)
 
         return {'FINISHED'}
 
@@ -1107,24 +1610,13 @@ class RB_PT_panel(bpy.types.Panel):
 
         layout.label(text="Images")
         layout.operator("refboard.add_image", icon="IMAGE_DATA")
+        layout.operator("refboard.paste_image", icon="PASTEDOWN")
 
         layout.separator()
 
         box = layout.box()
         box.label(text="Arrange")
 
-        box.label(text="Layout")
-        row = box.row(align=True)
-        op = row.operator("refboard.align_nodes", text="Row")
-        op.mode = "ROW"
-
-        op = row.operator("refboard.align_nodes", text="Column")
-        op.mode = "COL"
-
-        op = row.operator("refboard.align_nodes", text="Grid")
-        op.mode = "GRID"
-
-        box.separator()
         box.label(text="Match Size")
         row = box.row(align=True)
         op = row.operator("refboard.match_size", text="Width")
@@ -1132,6 +1624,42 @@ class RB_PT_panel(bpy.types.Panel):
 
         op = row.operator("refboard.match_size", text="Height")
         op.mode = "HEIGHT"
+
+        box.separator()
+        box.label(text="Layout")
+        row = box.row(align=True)
+        op = row.operator("refboard.align_nodes", text="Row", icon="RIGHTARROW")
+        op.mode = "ROW"
+
+        op = row.operator("refboard.align_nodes", text="Column", icon="DOWNARROW_HLT")
+        op.mode = "COL"
+
+        op = row.operator("refboard.align_nodes", text="Grid", icon="SNAP_VERTEX")
+        op.mode = "GRID"
+
+        box.separator()
+        box.label(text="Align")
+        row = box.row(align=True)
+        row.label(text="", icon="SPLIT_HORIZONTAL")
+        op = row.operator("refboard.align_to_active", text="Top")
+        op.mode = "H_TOP"
+
+        op = row.operator("refboard.align_to_active", text="Middle")
+        op.mode = "H_CENTER"
+
+        op = row.operator("refboard.align_to_active", text="Bottom")
+        op.mode = "H_BOTTOM"
+
+        row = box.row(align=True)
+        row.label(text="", icon="SPLIT_VERTICAL")
+        op = row.operator("refboard.align_to_active", text="Left")
+        op.mode = "V_LEFT"
+
+        op = row.operator("refboard.align_to_active", text="Center")
+        op.mode = "V_CENTER"
+
+        op = row.operator("refboard.align_to_active", text="Right")
+        op.mode = "V_RIGHT"
 
 
 # =========================================================
@@ -1143,11 +1671,13 @@ classes = (
     RefBoardImageNode,
     RB_OT_z_adjust,
     RB_OT_align_nodes,
+    RB_OT_align_to_active,
     RB_OT_match_size,
     RB_OT_select_image,
     RB_OT_scale_with_images,
     RB_OT_drop_image_node,
     RB_FH_image_drop,
+    RB_OT_paste_image_node,
     RB_OT_add_image_menu,
     RB_OT_add_image_node,
     RB_PT_panel,
@@ -1158,23 +1688,8 @@ def register():
 
     global _handle, _keymaps, _menu_added
 
-    if _handle:
-        bpy.types.SpaceNodeEditor.draw_handler_remove(_handle, "WINDOW")
-        _handle = None
-
-    for km, kmi in _keymaps:
-        try:
-            km.keymap_items.remove(kmi)
-        except RuntimeError:
-            pass
-
-    _keymaps.clear()
-
     for c in classes:
-        try:
-            bpy.utils.register_class(c)
-        except RuntimeError:
-            pass
+        bpy.utils.register_class(c)
 
     if not _menu_added:
         bpy.types.NODE_MT_add.append(draw_in_node_add_menu)
@@ -1205,6 +1720,8 @@ def register():
             )
             _keymaps.append((km, kmi))
         kmi = km.keymap_items.new("refboard.scale_with_images", "S", "PRESS")
+        _keymaps.append((km, kmi))
+        kmi = km.keymap_items.new("refboard.paste_image", "V", "PRESS", ctrl=True)
         _keymaps.append((km, kmi))
 
 
