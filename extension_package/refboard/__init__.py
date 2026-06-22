@@ -1,8 +1,8 @@
 bl_info = {
     "name": "RefBoard",
     "author": "Mandrew3D <moseenkowam@gmail.com>",
-    "version": (1, 3, 0),
-    "blender": (5, 1, 0),
+    "version": (1, 4, 0),
+    "blender": (4, 2, 0),
     "category": "Node",
 }
 
@@ -20,6 +20,7 @@ _handle = None
 _keymaps = []
 _click_candidate = None
 _menu_added = False
+_image_shader = None
 NODE_HEADER_HEIGHT = 120
 NODE_SPACING = 50
 DRAW_HANDLER_TYPE = "PRE_VIEW"
@@ -27,6 +28,46 @@ OUTLINE_WIDTH = 2.0
 SCALE_EPSILON = 0.0001
 CLICK_DRAG_THRESHOLD = 5
 IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".exr", ".webp"}
+IMAGE_SHADER_BUILTINS = (
+    "IMAGE_SCENE_LINEAR_TO_REC709_SRGB",
+)
+IMAGE_VERTEX_SHADER = """
+uniform mat4 ModelViewProjectionMatrix;
+
+in vec2 pos;
+in vec2 texCoord;
+
+out vec2 uvInterp;
+
+void main()
+{
+    uvInterp = texCoord;
+    gl_Position = ModelViewProjectionMatrix * vec4(pos.xy, 0.0, 1.0);
+}
+"""
+IMAGE_LINEAR_TO_SRGB_FRAGMENT_SHADER = """
+uniform sampler2D image;
+
+in vec2 uvInterp;
+
+out vec4 fragColor;
+
+vec3 linear_to_srgb(vec3 color)
+{
+    vec3 linear_color = max(color, vec3(0.0));
+    vec3 lower = linear_color * 12.92;
+    vec3 higher = 1.055 * pow(linear_color, vec3(1.0 / 2.4)) - 0.055;
+    vec3 cutoff = step(linear_color, vec3(0.0031308));
+
+    return mix(higher, lower, cutoff);
+}
+
+void main()
+{
+    vec4 color = texture(image, uvInterp);
+    fragColor = vec4(linear_to_srgb(color.rgb), color.a);
+}
+"""
 NUMERIC_INPUT_KEYS = {
     "ZERO": "0",
     "ONE": "1",
@@ -637,6 +678,30 @@ def get_node_outline_color(node, active_node, colors):
         return colors["selected"]
 
     return colors["normal"]
+
+
+def get_image_shader():
+    global _image_shader
+
+    if _image_shader:
+        return _image_shader
+
+    for shader_name in IMAGE_SHADER_BUILTINS:
+        try:
+            _image_shader = gpu.shader.from_builtin(shader_name)
+            return _image_shader
+        except ValueError:
+            continue
+
+    try:
+        _image_shader = gpu.types.GPUShader(
+            IMAGE_VERTEX_SHADER,
+            IMAGE_LINEAR_TO_SRGB_FRAGMENT_SHADER
+        )
+    except Exception:
+        _image_shader = gpu.shader.from_builtin("IMAGE")
+
+    return _image_shader
 
 
 def get_selection_center(nodes):
@@ -1341,7 +1406,7 @@ def draw_callback():
         return
 
     v2d = region.view2d
-    image_shader = gpu.shader.from_builtin("IMAGE_SCENE_LINEAR_TO_REC709_SRGB")
+    image_shader = get_image_shader()
     outline_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     outline_colors = get_refboard_outline_colors()
     active_node = tree.nodes.active

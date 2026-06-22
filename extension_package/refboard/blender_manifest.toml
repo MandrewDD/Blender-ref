@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "refboard"
-version = "1.3.0"
+version = "1.4.0"
 name = "RefBoard"
 tagline = "Arrange image references inside a dedicated node editor"
 maintainer = "Mandrew3D <moseenkowam@gmail.com>"
@@ -9,7 +9,7 @@ website = "https://github.com/MandrewDD/Blender-ref"
 type = "add-on"
 
 tags = ["Node", "User Interface"]
-blender_version_min = "5.1.0"
+blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 copyright = ["2026 Mandrew3D"]
 
