@@ -14,4 +14,4 @@ license = ["SPDX:GPL-3.0-or-later"]
 copyright = ["2026 Mandrew3D"]
 
 [permissions]
-files = "Load image files selected, dropped, or pasted by the user into RefBoard"
+files = "Load selected, dropped, or pasted images"
