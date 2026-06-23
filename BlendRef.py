@@ -140,7 +140,7 @@ def align_nodes_row(nodes, active):
     offset_x = 0.0
 
     for n in ordered_nodes:
-        w = n.image.size[0] * n.scale
+        w = get_node_image_width(n)
 
         n.location.x = start_x + offset_x
         n.location.y = y
@@ -166,7 +166,7 @@ def align_nodes_col(nodes, active):
     offset_y = 0.0
 
     for n in ordered_nodes:
-        h = n.image.size[1] * n.scale
+        h = get_node_image_height(n)
 
         if n != active:
             offset_y += h + NODE_HEADER_HEIGHT + NODE_SPACING
@@ -191,8 +191,8 @@ def align_nodes_grid(nodes, active):
     start_x = active.location.x
     start_y = active.location.y
 
-    max_width = max(n.image.size[0] * n.scale for n in ordered_nodes)
-    max_height = max(n.image.size[1] * n.scale for n in ordered_nodes)
+    max_width = max(get_node_image_width(n) for n in ordered_nodes)
+    max_height = max(get_node_image_height(n) for n in ordered_nodes)
     cell_width = max_width + NODE_SPACING
     cell_height = max_height + NODE_HEADER_HEIGHT + NODE_SPACING
 
@@ -204,12 +204,53 @@ def align_nodes_grid(nodes, active):
         n.location.y = start_y - row * cell_height
 
 
+def is_node_image_rotated_sideways(node):
+    return int(getattr(node, "rotation_quarters", 0)) % 2 != 0
+
+
+def get_node_image_base_width(node):
+    if is_node_image_rotated_sideways(node):
+        return node.image.size[1]
+
+    return node.image.size[0]
+
+
+def get_node_image_base_height(node):
+    if is_node_image_rotated_sideways(node):
+        return node.image.size[0]
+
+    return node.image.size[1]
+
+
 def get_node_image_width(node):
-    return node.image.size[0] * node.scale
+    return get_node_image_base_width(node) * node.scale
 
 
 def get_node_image_height(node):
-    return node.image.size[1] * node.scale
+    return get_node_image_base_height(node) * node.scale
+
+
+def get_node_image_uvs(node):
+    uvs = [
+        [0, 0],
+        [1, 0],
+        [1, 1],
+        [0, 1],
+    ]
+
+    if getattr(node, "flip_x", False):
+        for uv in uvs:
+            uv[0] = 1 - uv[0]
+
+    if getattr(node, "flip_y", False):
+        for uv in uvs:
+            uv[1] = 1 - uv[1]
+
+    for _ in range(int(getattr(node, "rotation_quarters", 0)) % 4):
+        for uv in uvs:
+            uv[0], uv[1] = 1 - uv[1], uv[0]
+
+    return tuple((uv[0], uv[1]) for uv in uvs)
 
 
 def align_nodes_to_active(nodes, active, mode):
@@ -271,6 +312,97 @@ def tag_refboard_redraw(context):
 
     if area:
         area.tag_redraw()
+
+
+def get_refboard_node_editor_context(context=None, tree=None):
+    area = getattr(context, "area", None) if context else None
+    space = getattr(context, "space_data", None) if context else None
+    window = getattr(context, "window", None) if context else None
+    screen = getattr(context, "screen", None) if context else None
+
+    if (
+        window
+        and screen
+        and area
+        and area.type == "NODE_EDITOR"
+        and space
+        and getattr(space, "type", None) == "NODE_EDITOR"
+        and (not tree or getattr(space, "node_tree", None) == tree)
+    ):
+        region = next((r for r in area.regions if r.type == "WINDOW"), None)
+
+        if region:
+            return window, screen, area, region, space
+
+    windows = []
+
+    if window:
+        windows.append(window)
+
+    windows.extend(
+        win for win in bpy.context.window_manager.windows
+        if win not in windows
+    )
+
+    for win in windows:
+        win_screen = getattr(win, "screen", None)
+
+        if not win_screen:
+            continue
+
+        for screen_area in win_screen.areas:
+            if screen_area.type != "NODE_EDITOR":
+                continue
+
+            screen_space = screen_area.spaces.active
+
+            if tree and getattr(screen_space, "node_tree", None) != tree:
+                continue
+
+            region = next((r for r in screen_area.regions if r.type == "WINDOW"), None)
+
+            if region:
+                return win, win_screen, screen_area, region, screen_space
+
+    return None, None, None, None, None
+
+
+def run_refboard_frame_selected(context=None, tree=None):
+    window, screen, area, region, space = get_refboard_node_editor_context(context, tree)
+
+    if not window or not screen or not area or not region or not space:
+        return False
+
+    try:
+        with bpy.context.temp_override(
+            window=window,
+            screen=screen,
+            area=area,
+            region=region,
+            space_data=space
+        ):
+            bpy.ops.node.view_selected()
+    except Exception as exc:
+        print(f"RefBoard: could not frame selected nodes: {exc}")
+        return False
+
+    area.tag_redraw()
+    return True
+
+
+def frame_refboard_selected(context, tree=None):
+    run_refboard_frame_selected(context, tree)
+
+    def deferred_frame():
+        run_refboard_frame_selected(None, tree)
+        return None
+
+    try:
+        bpy.app.timers.register(deferred_frame, first_interval=0.05)
+    except Exception as exc:
+        print(f"RefBoard: could not schedule frame selected: {exc}")
+
+    tag_refboard_redraw(context)
 
 
 def get_image_filepaths(operator):
@@ -529,6 +661,7 @@ def add_image_nodes_from_paths(
         align_nodes_row(created_nodes, created_nodes[0])
 
     tag_refboard_redraw(context)
+    frame_refboard_selected(context, tree)
 
     return created_nodes
 
@@ -638,6 +771,25 @@ def coerce_float(value, default):
         return default
 
 
+def coerce_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+
+    return default
+
+
 def coerce_location(value):
     if not isinstance(value, (list, tuple)) or len(value) < 2:
         return (0.0, 0.0)
@@ -719,6 +871,14 @@ def import_refbmd_file(operator, context, filepath):
                     node.location.y = location[1]
                     node.scale = max(coerce_float(node_data.get("scale"), 1.0), SCALE_EPSILON)
                     node.z_order = int(coerce_float(node_data.get("z_order"), index))
+                    node.rotation_quarters = int(coerce_float(node_data.get("rotation_quarters"), 0)) % 4
+                    node.flip_x = coerce_bool(node_data.get("flip_x"), False)
+                    node.flip_y = coerce_bool(node_data.get("flip_y"), False)
+                    node.select = True
+
+                    if imported_count == 0:
+                        tree.nodes.active = node
+
                     imported_count += 1
     except Exception:
         if tree:
@@ -741,8 +901,36 @@ def set_context_refboard_tree(context, tree):
     if space and space.type == "NODE_EDITOR":
         try:
             space.node_tree = tree
+            return
         except Exception:
             pass
+
+    window = getattr(context, "window", None)
+    windows = []
+
+    if window:
+        windows.append(window)
+
+    windows.extend(
+        win for win in bpy.context.window_manager.windows
+        if win not in windows
+    )
+
+    for win in windows:
+        screen = getattr(win, "screen", None)
+
+        if not screen:
+            continue
+
+        for area in screen.areas:
+            if area.type != "NODE_EDITOR":
+                continue
+
+            try:
+                area.spaces.active.node_tree = tree
+                return
+            except Exception:
+                pass
 
 
 def import_refbmd_files(operator, context, paths):
@@ -768,6 +956,7 @@ def import_refbmd_files(operator, context, paths):
     if last_tree:
         set_context_refboard_tree(context, last_tree)
         tag_refboard_redraw(context)
+        frame_refboard_selected(context, last_tree)
 
     return imported_boards, imported_images
 
@@ -898,8 +1087,8 @@ def find_image_node_at_location(tree, location):
     )
 
     for node in nodes:
-        image_width = node.image.size[0] * node.scale
-        image_height = node.image.size[1] * node.scale
+        image_width = get_node_image_width(node)
+        image_height = get_node_image_height(node)
 
         if (
             node.location.x <= x <= node.location.x + image_width
@@ -1305,6 +1494,60 @@ class RB_OT_z_adjust(bpy.types.Operator):
 
 
 # =========================================================
+# IMAGE TRANSFORM
+# =========================================================
+
+class RB_OT_image_transform(bpy.types.Operator):
+    bl_idname = "refboard.image_transform"
+    bl_label = "Image Transform"
+    bl_description = "Rotate or mirror a RefBoard image"
+
+    node_name: bpy.props.StringProperty()
+    mode: bpy.props.StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return is_refboard_context(context)
+
+    @classmethod
+    def description(cls, context, properties):
+        descriptions = {
+            "ROTATE_CW": "Rotate this image clockwise",
+            "ROTATE_CCW": "Rotate this image counter-clockwise",
+            "FLIP_X": "Mirror this image horizontally",
+            "FLIP_Y": "Mirror this image vertically",
+        }
+
+        return descriptions.get(properties.mode, cls.bl_description)
+
+    def execute(self, context):
+        tree = context.space_data.node_tree
+        node = tree.nodes.get(self.node_name)
+
+        if (
+            not node
+            or node.bl_idname != "RefBoardImageNodeType"
+            or not node.image
+        ):
+            return {'CANCELLED'}
+
+        if self.mode == "ROTATE_CW":
+            node.rotation_quarters = (node.rotation_quarters + 1) % 4
+        elif self.mode == "ROTATE_CCW":
+            node.rotation_quarters = (node.rotation_quarters - 1) % 4
+        elif self.mode == "FLIP_X":
+            node.flip_x = not node.flip_x
+        elif self.mode == "FLIP_Y":
+            node.flip_y = not node.flip_y
+        else:
+            return {'CANCELLED'}
+
+        tag_refboard_redraw(context)
+
+        return {'FINISHED'}
+
+
+# =========================================================
 # ALIGN OPERATOR (NEW)
 # =========================================================
 
@@ -1457,18 +1700,22 @@ class RB_OT_match_size(bpy.types.Operator):
             return {'CANCELLED'}
 
         if self.mode == "WIDTH":
-            target_width = active.image.size[0] * active.scale
+            target_width = get_node_image_width(active)
 
             for n in nodes:
-                if n.image.size[0] > 0:
-                    n.scale = target_width / n.image.size[0]
+                image_width = get_node_image_base_width(n)
+
+                if image_width > 0:
+                    n.scale = target_width / image_width
 
         elif self.mode == "HEIGHT":
-            target_height = active.image.size[1] * active.scale
+            target_height = get_node_image_height(active)
 
             for n in nodes:
-                if n.image.size[1] > 0:
-                    n.scale = target_height / n.image.size[1]
+                image_height = get_node_image_base_height(n)
+
+                if image_height > 0:
+                    n.scale = target_height / image_height
 
         tag_refboard_redraw(context)
 
@@ -1865,6 +2112,27 @@ class RefBoardImageNode(bpy.types.Node):
         description="Draw order for this image; higher values are drawn in front",
         update=update_node_draw
     )
+    rotation_quarters: bpy.props.IntProperty(
+        default=0,
+        min=0,
+        max=3,
+        description="Image rotation in 90 degree clockwise steps",
+        update=update_node_draw
+    )
+    flip_x: bpy.props.BoolProperty(
+        default=False,
+        description="Mirror this image horizontally",
+        update=update_node_draw
+    )
+    flip_y: bpy.props.BoolProperty(
+        default=False,
+        description="Mirror this image vertically",
+        update=update_node_draw
+    )
+    show_image_transform: bpy.props.BoolProperty(
+        default=False,
+        description="Show image transform controls"
+    )
 
     def draw_buttons(self, context, layout):
         layout.template_ID(self, "image", open="image.open")
@@ -1881,6 +2149,37 @@ class RefBoardImageNode(bpy.types.Node):
         op = row.operator("refboard.z_adjust", text="", icon="TRIA_RIGHT")
         op.node_name = self.name
         op.direction = "FRONT"
+
+        box = layout.box()
+        header = box.row(align=True)
+        header.prop(
+            self,
+            "show_image_transform",
+            text="Image Transform",
+            icon="TRIA_DOWN" if self.show_image_transform else "TRIA_RIGHT",
+            emboss=False
+        )
+
+        if self.show_image_transform:
+            row = box.row(align=True)
+
+            op = row.operator("refboard.image_transform", text="", icon="LOOP_BACK")
+            op.node_name = self.name
+            op.mode = "ROTATE_CCW"
+
+            op = row.operator("refboard.image_transform", text="", icon="LOOP_FORWARDS")
+            op.node_name = self.name
+            op.mode = "ROTATE_CW"
+
+            row = box.row(align=True)
+
+            op = row.operator("refboard.image_transform", text="Flip X", icon="FORWARD")
+            op.node_name = self.name
+            op.mode = "FLIP_X"
+
+            op = row.operator("refboard.image_transform", text="Flip Y", icon="SORT_DESC")
+            op.node_name = self.name
+            op.mode = "FLIP_Y"
 
 
 # =========================================================
@@ -1925,8 +2224,8 @@ def draw_callback():
                 print(f"RefBoard: could not draw image {img.name!r}: {exc}")
                 continue
 
-            w = img.size[0] * node.scale
-            h = img.size[1] * node.scale
+            w = get_node_image_width(node)
+            h = get_node_image_height(node)
 
             if DRAW_HANDLER_TYPE in {"PRE_VIEW", "POST_VIEW"}:
                 x1, y1 = refboard_to_view_location(node.location.x, node.location.y)
@@ -1944,12 +2243,7 @@ def draw_callback():
                 (x1, y2),
             )
 
-            uvs = (
-                (0, 0),
-                (1, 0),
-                (1, 1),
-                (0, 1),
-            )
+            uvs = get_node_image_uvs(node)
 
             batch = batch_for_shader(image_shader, "TRI_FAN", {
                 "pos": coords,
@@ -2201,12 +2495,25 @@ class RB_OT_export_refbmd(bpy.types.Operator):
                         ext = get_image_export_extension(node.image)
                         archive_path = f"images/image_{index:04d}{ext}"
                         write_image_to_refbmd(zip_file, node.image, archive_path, temp_dir)
-                        manifest["nodes"].append({
+                        node_entry = {
                             "image": archive_path,
                             "location": [float(node.location.x), float(node.location.y)],
                             "scale": float(node.scale),
                             "z_order": int(node.z_order),
-                        })
+                        }
+
+                        rotation_quarters = int(getattr(node, "rotation_quarters", 0)) % 4
+
+                        if rotation_quarters:
+                            node_entry["rotation_quarters"] = rotation_quarters
+
+                        if getattr(node, "flip_x", False):
+                            node_entry["flip_x"] = True
+
+                        if getattr(node, "flip_y", False):
+                            node_entry["flip_y"] = True
+
+                        manifest["nodes"].append(node_entry)
 
                     zip_file.writestr(
                         "manifest.json",
@@ -2252,6 +2559,7 @@ class RB_OT_import_refbmd(bpy.types.Operator):
         set_context_refboard_tree(context, tree)
         self.report({'INFO'}, f"Imported RefBoard: {tree.name}")
         tag_refboard_redraw(context)
+        frame_refboard_selected(context, tree)
         return {'FINISHED'}
 
 
@@ -2373,6 +2681,7 @@ classes = (
     RefBoardTree,
     RefBoardImageNode,
     RB_OT_z_adjust,
+    RB_OT_image_transform,
     RB_OT_align_nodes,
     RB_OT_align_to_active,
     RB_OT_match_size,

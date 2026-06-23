@@ -10,10 +10,12 @@ import bpy
 import gpu
 import gpu.texture
 import ctypes
+import json
 import math
 import os
 import struct
 import tempfile
+import zipfile
 from gpu_extras.batch import batch_for_shader
 
 _handle = None
@@ -29,14 +31,18 @@ DRAW_HANDLER_TYPE = "PRE_VIEW"
 OUTLINE_WIDTH = 2.0
 TRANSFORM_LINE_WIDTH = 1.0
 TRANSFORM_ARROW_WIDTH = 2.0
-TRANSFORM_DASH_LENGTH = 8.0
-TRANSFORM_DASH_GAP = 8.0
+TRANSFORM_DASH_LENGTH = 4.0
+TRANSFORM_DASH_GAP = 4.0
+TRANSFORM_DASH_OFFSET = (-1.0, 1.0)
 TRANSFORM_ARROW_OFFSET = 5.0
 TRANSFORM_ARROW_LENGTH = 10.0
 TRANSFORM_ARROW_SIZE = 5.0
 SCALE_EPSILON = 0.0001
 CLICK_DRAG_THRESHOLD = 5
 IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".exr", ".webp"}
+REFBMD_EXTENSION = ".refbmd"
+REFBMD_FORMAT = "refbmd"
+REFBMD_FORMAT_VERSION = 1
 IMAGE_SHADER_BUILTINS = (
     "IMAGE_SCENE_LINEAR_TO_REC709_SRGB",
 )
@@ -134,7 +140,7 @@ def align_nodes_row(nodes, active):
     offset_x = 0.0
 
     for n in ordered_nodes:
-        w = n.image.size[0] * n.scale
+        w = get_node_image_width(n)
 
         n.location.x = start_x + offset_x
         n.location.y = y
@@ -160,7 +166,7 @@ def align_nodes_col(nodes, active):
     offset_y = 0.0
 
     for n in ordered_nodes:
-        h = n.image.size[1] * n.scale
+        h = get_node_image_height(n)
 
         if n != active:
             offset_y += h + NODE_HEADER_HEIGHT + NODE_SPACING
@@ -185,8 +191,8 @@ def align_nodes_grid(nodes, active):
     start_x = active.location.x
     start_y = active.location.y
 
-    max_width = max(n.image.size[0] * n.scale for n in ordered_nodes)
-    max_height = max(n.image.size[1] * n.scale for n in ordered_nodes)
+    max_width = max(get_node_image_width(n) for n in ordered_nodes)
+    max_height = max(get_node_image_height(n) for n in ordered_nodes)
     cell_width = max_width + NODE_SPACING
     cell_height = max_height + NODE_HEADER_HEIGHT + NODE_SPACING
 
@@ -198,12 +204,53 @@ def align_nodes_grid(nodes, active):
         n.location.y = start_y - row * cell_height
 
 
+def is_node_image_rotated_sideways(node):
+    return int(getattr(node, "rotation_quarters", 0)) % 2 != 0
+
+
+def get_node_image_base_width(node):
+    if is_node_image_rotated_sideways(node):
+        return node.image.size[1]
+
+    return node.image.size[0]
+
+
+def get_node_image_base_height(node):
+    if is_node_image_rotated_sideways(node):
+        return node.image.size[0]
+
+    return node.image.size[1]
+
+
 def get_node_image_width(node):
-    return node.image.size[0] * node.scale
+    return get_node_image_base_width(node) * node.scale
 
 
 def get_node_image_height(node):
-    return node.image.size[1] * node.scale
+    return get_node_image_base_height(node) * node.scale
+
+
+def get_node_image_uvs(node):
+    uvs = [
+        [0, 0],
+        [1, 0],
+        [1, 1],
+        [0, 1],
+    ]
+
+    if getattr(node, "flip_x", False):
+        for uv in uvs:
+            uv[0] = 1 - uv[0]
+
+    if getattr(node, "flip_y", False):
+        for uv in uvs:
+            uv[1] = 1 - uv[1]
+
+    for _ in range(int(getattr(node, "rotation_quarters", 0)) % 4):
+        for uv in uvs:
+            uv[0], uv[1] = 1 - uv[1], uv[0]
+
+    return tuple((uv[0], uv[1]) for uv in uvs)
 
 
 def align_nodes_to_active(nodes, active, mode):
@@ -267,6 +314,97 @@ def tag_refboard_redraw(context):
         area.tag_redraw()
 
 
+def get_refboard_node_editor_context(context=None, tree=None):
+    area = getattr(context, "area", None) if context else None
+    space = getattr(context, "space_data", None) if context else None
+    window = getattr(context, "window", None) if context else None
+    screen = getattr(context, "screen", None) if context else None
+
+    if (
+        window
+        and screen
+        and area
+        and area.type == "NODE_EDITOR"
+        and space
+        and getattr(space, "type", None) == "NODE_EDITOR"
+        and (not tree or getattr(space, "node_tree", None) == tree)
+    ):
+        region = next((r for r in area.regions if r.type == "WINDOW"), None)
+
+        if region:
+            return window, screen, area, region, space
+
+    windows = []
+
+    if window:
+        windows.append(window)
+
+    windows.extend(
+        win for win in bpy.context.window_manager.windows
+        if win not in windows
+    )
+
+    for win in windows:
+        win_screen = getattr(win, "screen", None)
+
+        if not win_screen:
+            continue
+
+        for screen_area in win_screen.areas:
+            if screen_area.type != "NODE_EDITOR":
+                continue
+
+            screen_space = screen_area.spaces.active
+
+            if tree and getattr(screen_space, "node_tree", None) != tree:
+                continue
+
+            region = next((r for r in screen_area.regions if r.type == "WINDOW"), None)
+
+            if region:
+                return win, win_screen, screen_area, region, screen_space
+
+    return None, None, None, None, None
+
+
+def run_refboard_frame_selected(context=None, tree=None):
+    window, screen, area, region, space = get_refboard_node_editor_context(context, tree)
+
+    if not window or not screen or not area or not region or not space:
+        return False
+
+    try:
+        with bpy.context.temp_override(
+            window=window,
+            screen=screen,
+            area=area,
+            region=region,
+            space_data=space
+        ):
+            bpy.ops.node.view_selected()
+    except Exception as exc:
+        print(f"RefBoard: could not frame selected nodes: {exc}")
+        return False
+
+    area.tag_redraw()
+    return True
+
+
+def frame_refboard_selected(context, tree=None):
+    run_refboard_frame_selected(context, tree)
+
+    def deferred_frame():
+        run_refboard_frame_selected(None, tree)
+        return None
+
+    try:
+        bpy.app.timers.register(deferred_frame, first_interval=0.05)
+    except Exception as exc:
+        print(f"RefBoard: could not schedule frame selected: {exc}")
+
+    tag_refboard_redraw(context)
+
+
 def get_image_filepaths(operator):
     if operator.files:
         return [
@@ -310,7 +448,27 @@ def is_supported_image_path(filepath):
     return os.path.splitext(filepath)[1].lower() in IMAGE_FILE_EXTENSIONS
 
 
-def get_clipboard_image_filepaths():
+def is_supported_refbmd_path(filepath):
+    return os.path.splitext(filepath)[1].lower() == REFBMD_EXTENSION
+
+
+def split_refboard_transfer_paths(paths):
+    image_paths = []
+    refbmd_paths = []
+
+    for filepath in paths:
+        if not os.path.isfile(filepath):
+            continue
+
+        if is_supported_image_path(filepath):
+            image_paths.append(filepath)
+        elif is_supported_refbmd_path(filepath):
+            refbmd_paths.append(filepath)
+
+    return image_paths, refbmd_paths
+
+
+def get_clipboard_transfer_filepaths():
     if os.name != "nt":
         return [], False
 
@@ -366,7 +524,10 @@ def get_clipboard_hdrop_filepaths():
         shell32.DragQueryFileW(handle, index, buffer, length + 1)
         filepath = bpy.path.abspath(buffer.value)
 
-        if is_supported_image_path(filepath) and os.path.isfile(filepath):
+        if (
+            os.path.isfile(filepath)
+            and (is_supported_image_path(filepath) or is_supported_refbmd_path(filepath))
+        ):
             paths.append(filepath)
 
     return paths
@@ -500,8 +661,304 @@ def add_image_nodes_from_paths(
         align_nodes_row(created_nodes, created_nodes[0])
 
     tag_refboard_redraw(context)
+    frame_refboard_selected(context, tree)
 
     return created_nodes
+
+
+def sanitize_refbmd_filename(name):
+    safe_name = "".join(
+        c if c not in '<>:"/\\|?*' and ord(c) >= 32 else "_"
+        for c in name.strip()
+    ).strip(" .")
+
+    return safe_name or "RefBoard"
+
+
+def ensure_refbmd_extension(filepath):
+    root, ext = os.path.splitext(filepath)
+
+    if ext.lower() == REFBMD_EXTENSION:
+        return filepath
+
+    return root + REFBMD_EXTENSION if ext else filepath + REFBMD_EXTENSION
+
+
+def get_desktop_directory():
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+
+    if os.path.isdir(desktop):
+        return desktop
+
+    return os.path.expanduser("~")
+
+
+def get_refbmd_default_directory():
+    blend_filepath = bpy.data.filepath
+
+    if blend_filepath:
+        directory = os.path.dirname(bpy.path.abspath(blend_filepath))
+
+        if directory:
+            return directory
+
+    return get_desktop_directory()
+
+
+def get_refbmd_default_export_path(tree):
+    filename = sanitize_refbmd_filename(tree.name) + REFBMD_EXTENSION
+
+    return os.path.join(get_refbmd_default_directory(), filename)
+
+
+def get_unique_refboard_name(base_name):
+    clean_name = base_name.strip() or "RefBoard"
+    existing_names = set(bpy.data.node_groups.keys())
+
+    if clean_name not in existing_names:
+        return clean_name
+
+    index = 1
+
+    while True:
+        candidate = f"{clean_name} {index:03d}"
+
+        if candidate not in existing_names:
+            return candidate
+
+        index += 1
+
+
+def get_image_export_extension(image):
+    filepath = bpy.path.abspath(image.filepath) if image.filepath else ""
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext in IMAGE_FILE_EXTENSIONS:
+        return ext
+
+    return ".png"
+
+
+def write_image_to_refbmd(zip_file, image, archive_path, temp_dir):
+    packed_file = getattr(image, "packed_file", None)
+    filepath = bpy.path.abspath(image.filepath) if image.filepath else ""
+
+    if packed_file:
+        packed_data = getattr(packed_file, "data", None)
+
+        if packed_data:
+            zip_file.writestr(archive_path, bytes(packed_data))
+            return
+
+    if filepath and os.path.isfile(filepath):
+        zip_file.write(filepath, archive_path)
+        return
+
+    temp_path = os.path.join(temp_dir, os.path.basename(archive_path))
+
+    try:
+        image.save_render(temp_path, scene=bpy.context.scene)
+    except Exception:
+        image.save_render(temp_path)
+
+    zip_file.write(temp_path, archive_path)
+
+
+def coerce_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def coerce_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+
+    return default
+
+
+def coerce_location(value):
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return (0.0, 0.0)
+
+    return (coerce_float(value[0], 0.0), coerce_float(value[1], 0.0))
+
+
+def safe_refbmd_member_path(path):
+    if not isinstance(path, str):
+        return None
+
+    normalized = path.replace("\\", "/").lstrip("/")
+
+    if (
+        not normalized
+        or normalized.startswith("../")
+        or "/../" in normalized
+        or normalized == ".."
+    ):
+        return None
+
+    return normalized
+
+
+def import_refbmd_file(operator, context, filepath):
+    board_base_name = os.path.splitext(os.path.basename(filepath))[0]
+    board_name = get_unique_refboard_name(board_base_name)
+    imported_count = 0
+    tree = None
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="refbmd_import_") as temp_dir:
+            with zipfile.ZipFile(filepath, "r") as zip_file:
+                manifest = json.loads(zip_file.read("manifest.json").decode("utf-8"))
+
+                if not isinstance(manifest, dict):
+                    manifest = {}
+
+                node_entries = manifest.get("nodes", [])
+
+                if not isinstance(node_entries, list):
+                    node_entries = []
+
+                tree = bpy.data.node_groups.new(board_name, "RefBoardTreeType")
+
+                for index, node_data in enumerate(node_entries):
+                    if not isinstance(node_data, dict):
+                        continue
+
+                    archive_path = safe_refbmd_member_path(node_data.get("image"))
+
+                    if not archive_path or archive_path not in zip_file.namelist():
+                        continue
+
+                    image_ext = os.path.splitext(archive_path)[1].lower()
+
+                    if image_ext not in IMAGE_FILE_EXTENSIONS:
+                        image_ext = ".png"
+
+                    temp_image_path = os.path.join(temp_dir, f"image_{index:04d}{image_ext}")
+
+                    with open(temp_image_path, "wb") as temp_image_file:
+                        temp_image_file.write(zip_file.read(archive_path))
+
+                    image = load_image_for_operator(operator, temp_image_path)
+
+                    if not image:
+                        continue
+
+                    try:
+                        image.pack()
+                    except RuntimeError as exc:
+                        print(f"RefBoard: could not pack imported image {archive_path!r}: {exc}")
+
+                    node = tree.nodes.new("RefBoardImageNodeType")
+                    node.image = image
+                    location = coerce_location(node_data.get("location"))
+                    node.location.x = location[0]
+                    node.location.y = location[1]
+                    node.scale = max(coerce_float(node_data.get("scale"), 1.0), SCALE_EPSILON)
+                    node.z_order = int(coerce_float(node_data.get("z_order"), index))
+                    node.rotation_quarters = int(coerce_float(node_data.get("rotation_quarters"), 0)) % 4
+                    node.flip_x = coerce_bool(node_data.get("flip_x"), False)
+                    node.flip_y = coerce_bool(node_data.get("flip_y"), False)
+                    node.select = True
+
+                    if imported_count == 0:
+                        tree.nodes.active = node
+
+                    imported_count += 1
+    except Exception:
+        if tree:
+            bpy.data.node_groups.remove(tree)
+
+        raise
+
+    if imported_count == 0:
+        if tree:
+            bpy.data.node_groups.remove(tree)
+
+        return None, 0
+
+    return tree, imported_count
+
+
+def set_context_refboard_tree(context, tree):
+    space = getattr(context, "space_data", None)
+
+    if space and space.type == "NODE_EDITOR":
+        try:
+            space.node_tree = tree
+            return
+        except Exception:
+            pass
+
+    window = getattr(context, "window", None)
+    windows = []
+
+    if window:
+        windows.append(window)
+
+    windows.extend(
+        win for win in bpy.context.window_manager.windows
+        if win not in windows
+    )
+
+    for win in windows:
+        screen = getattr(win, "screen", None)
+
+        if not screen:
+            continue
+
+        for area in screen.areas:
+            if area.type != "NODE_EDITOR":
+                continue
+
+            try:
+                area.spaces.active.node_tree = tree
+                return
+            except Exception:
+                pass
+
+
+def import_refbmd_files(operator, context, paths):
+    imported_boards = 0
+    imported_images = 0
+    last_tree = None
+
+    for filepath in paths:
+        try:
+            tree, image_count = import_refbmd_file(operator, context, filepath)
+        except Exception as exc:
+            operator.report({'WARNING'}, f"Could not import {os.path.basename(filepath)}: {exc}")
+            continue
+
+        if not tree:
+            operator.report({'WARNING'}, f"No images in {os.path.basename(filepath)}")
+            continue
+
+        imported_boards += 1
+        imported_images += image_count
+        last_tree = tree
+
+    if last_tree:
+        set_context_refboard_tree(context, last_tree)
+        tag_refboard_redraw(context)
+        frame_refboard_selected(context, last_tree)
+
+    return imported_boards, imported_images
 
 
 def update_node_draw(self, context):
@@ -630,8 +1087,8 @@ def find_image_node_at_location(tree, location):
     )
 
     for node in nodes:
-        image_width = node.image.size[0] * node.scale
-        image_height = node.image.size[1] * node.scale
+        image_width = get_node_image_width(node)
+        image_height = get_node_image_height(node)
 
         if (
             node.location.x <= x <= node.location.x + image_width
@@ -689,20 +1146,33 @@ def get_node_outline_color(node, active_node, colors):
     return colors["normal"]
 
 
-def get_transform_line_color():
+def get_theme_rgb(owner, name, fallback, alpha=1.0):
+    value = getattr(owner, name, None)
+
+    if value is None:
+        return fallback
+
+    color = tuple(value)
+
+    if len(color) < 3:
+        return fallback
+
+    return (color[0], color[1], color[2], alpha)
+
+
+def get_transform_line_colors():
     theme = bpy.context.preferences.themes[0]
+    editor_theme = getattr(theme, "node_editor", None)
 
-    for owner_name in ("node_editor", "view_3d"):
-        owner = getattr(theme, owner_name, None)
+    if not editor_theme:
+        return (0.0, 0.0, 0.0, 1.0), None
 
-        if owner:
-            return color_from_theme(
-                owner,
-                ("view_overlay", "transform", "grid"),
-                (0.8, 0.8, 0.8, 1.0)
-            )
+    if bpy.app.version >= (5, 0, 0):
+        fg = get_theme_rgb(editor_theme, "text_hi", (1.0, 1.0, 1.0, 1.0), 1.0)
+        bg = get_theme_rgb(editor_theme, "back", (0.0, 0.0, 0.0, 0.5), 0.5)
+        return fg, bg
 
-    return (0.8, 0.8, 0.8, 1.0)
+    return get_theme_rgb(editor_theme, "view_overlay", (0.0, 0.0, 0.0, 1.0), 1.0), None
 
 
 def make_dashed_line(start, end, dash_length, dash_gap):
@@ -765,7 +1235,11 @@ def make_transform_arrow(center, angle, direction):
     return (base, tip, tip, wing_a, tip, wing_b)
 
 
-def draw_line_coords(coords, width):
+def offset_coords(coords, offset):
+    return [(x + offset[0], y + offset[1]) for x, y in coords]
+
+
+def draw_line_coords(coords, width, color):
     if not coords:
         return
 
@@ -774,7 +1248,7 @@ def draw_line_coords(coords, width):
 
     gpu.state.line_width_set(width)
     shader.bind()
-    shader.uniform_float("color", get_transform_line_color())
+    shader.uniform_float("color", color)
     batch.draw(shader)
 
 
@@ -827,7 +1301,17 @@ def draw_scale_overlay():
         TRANSFORM_DASH_LENGTH,
         TRANSFORM_DASH_GAP
     )
-    draw_line_coords(line_coords, TRANSFORM_LINE_WIDTH)
+    fg_color, bg_color = get_transform_line_colors()
+
+    if bg_color:
+        draw_line_coords(line_coords, TRANSFORM_LINE_WIDTH, bg_color)
+        draw_line_coords(
+            offset_coords(line_coords, TRANSFORM_DASH_OFFSET),
+            TRANSFORM_LINE_WIDTH,
+            fg_color
+        )
+    else:
+        draw_line_coords(line_coords, TRANSFORM_LINE_WIDTH, fg_color)
 
     dx = end_region[0] - start_region[0]
     dy = end_region[1] - start_region[1]
@@ -839,7 +1323,11 @@ def draw_scale_overlay():
     arrow_coords = []
     arrow_coords.extend(make_transform_arrow(end_region, angle, 1.0))
     arrow_coords.extend(make_transform_arrow(end_region, angle, -1.0))
-    draw_line_coords(arrow_coords, TRANSFORM_ARROW_WIDTH)
+
+    if bg_color:
+        draw_line_coords(arrow_coords, TRANSFORM_ARROW_WIDTH * 2.0, bg_color)
+
+    draw_line_coords(arrow_coords, TRANSFORM_ARROW_WIDTH, fg_color)
 
 
 def draw_scale_overlay_callback():
@@ -1006,6 +1494,60 @@ class RB_OT_z_adjust(bpy.types.Operator):
 
 
 # =========================================================
+# IMAGE TRANSFORM
+# =========================================================
+
+class RB_OT_image_transform(bpy.types.Operator):
+    bl_idname = "refboard.image_transform"
+    bl_label = "Image Transform"
+    bl_description = "Rotate or mirror a RefBoard image"
+
+    node_name: bpy.props.StringProperty()
+    mode: bpy.props.StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return is_refboard_context(context)
+
+    @classmethod
+    def description(cls, context, properties):
+        descriptions = {
+            "ROTATE_CW": "Rotate this image clockwise",
+            "ROTATE_CCW": "Rotate this image counter-clockwise",
+            "FLIP_X": "Mirror this image horizontally",
+            "FLIP_Y": "Mirror this image vertically",
+        }
+
+        return descriptions.get(properties.mode, cls.bl_description)
+
+    def execute(self, context):
+        tree = context.space_data.node_tree
+        node = tree.nodes.get(self.node_name)
+
+        if (
+            not node
+            or node.bl_idname != "RefBoardImageNodeType"
+            or not node.image
+        ):
+            return {'CANCELLED'}
+
+        if self.mode == "ROTATE_CW":
+            node.rotation_quarters = (node.rotation_quarters + 1) % 4
+        elif self.mode == "ROTATE_CCW":
+            node.rotation_quarters = (node.rotation_quarters - 1) % 4
+        elif self.mode == "FLIP_X":
+            node.flip_x = not node.flip_x
+        elif self.mode == "FLIP_Y":
+            node.flip_y = not node.flip_y
+        else:
+            return {'CANCELLED'}
+
+        tag_refboard_redraw(context)
+
+        return {'FINISHED'}
+
+
+# =========================================================
 # ALIGN OPERATOR (NEW)
 # =========================================================
 
@@ -1158,18 +1700,22 @@ class RB_OT_match_size(bpy.types.Operator):
             return {'CANCELLED'}
 
         if self.mode == "WIDTH":
-            target_width = active.image.size[0] * active.scale
+            target_width = get_node_image_width(active)
 
             for n in nodes:
-                if n.image.size[0] > 0:
-                    n.scale = target_width / n.image.size[0]
+                image_width = get_node_image_base_width(n)
+
+                if image_width > 0:
+                    n.scale = target_width / image_width
 
         elif self.mode == "HEIGHT":
-            target_height = active.image.size[1] * active.scale
+            target_height = get_node_image_height(active)
 
             for n in nodes:
-                if n.image.size[1] > 0:
-                    n.scale = target_height / n.image.size[1]
+                image_height = get_node_image_base_height(n)
+
+                if image_height > 0:
+                    n.scale = target_height / image_height
 
         tag_refboard_redraw(context)
 
@@ -1566,6 +2112,27 @@ class RefBoardImageNode(bpy.types.Node):
         description="Draw order for this image; higher values are drawn in front",
         update=update_node_draw
     )
+    rotation_quarters: bpy.props.IntProperty(
+        default=0,
+        min=0,
+        max=3,
+        description="Image rotation in 90 degree clockwise steps",
+        update=update_node_draw
+    )
+    flip_x: bpy.props.BoolProperty(
+        default=False,
+        description="Mirror this image horizontally",
+        update=update_node_draw
+    )
+    flip_y: bpy.props.BoolProperty(
+        default=False,
+        description="Mirror this image vertically",
+        update=update_node_draw
+    )
+    show_image_transform: bpy.props.BoolProperty(
+        default=False,
+        description="Show image transform controls"
+    )
 
     def draw_buttons(self, context, layout):
         layout.template_ID(self, "image", open="image.open")
@@ -1582,6 +2149,37 @@ class RefBoardImageNode(bpy.types.Node):
         op = row.operator("refboard.z_adjust", text="", icon="TRIA_RIGHT")
         op.node_name = self.name
         op.direction = "FRONT"
+
+        box = layout.box()
+        header = box.row(align=True)
+        header.prop(
+            self,
+            "show_image_transform",
+            text="Image Transform",
+            icon="TRIA_DOWN" if self.show_image_transform else "TRIA_RIGHT",
+            emboss=False
+        )
+
+        if self.show_image_transform:
+            row = box.row(align=True)
+
+            op = row.operator("refboard.image_transform", text="", icon="LOOP_BACK")
+            op.node_name = self.name
+            op.mode = "ROTATE_CCW"
+
+            op = row.operator("refboard.image_transform", text="", icon="LOOP_FORWARDS")
+            op.node_name = self.name
+            op.mode = "ROTATE_CW"
+
+            row = box.row(align=True)
+
+            op = row.operator("refboard.image_transform", text="Flip X", icon="FORWARD")
+            op.node_name = self.name
+            op.mode = "FLIP_X"
+
+            op = row.operator("refboard.image_transform", text="Flip Y", icon="SORT_DESC")
+            op.node_name = self.name
+            op.mode = "FLIP_Y"
 
 
 # =========================================================
@@ -1626,8 +2224,8 @@ def draw_callback():
                 print(f"RefBoard: could not draw image {img.name!r}: {exc}")
                 continue
 
-            w = img.size[0] * node.scale
-            h = img.size[1] * node.scale
+            w = get_node_image_width(node)
+            h = get_node_image_height(node)
 
             if DRAW_HANDLER_TYPE in {"PRE_VIEW", "POST_VIEW"}:
                 x1, y1 = refboard_to_view_location(node.location.x, node.location.y)
@@ -1645,12 +2243,7 @@ def draw_callback():
                 (x1, y2),
             )
 
-            uvs = (
-                (0, 0),
-                (1, 0),
-                (1, 1),
-                (0, 1),
-            )
+            uvs = get_node_image_uvs(node)
 
             batch = batch_for_shader(image_shader, "TRI_FAN", {
                 "pos": coords,
@@ -1705,16 +2298,26 @@ class RB_OT_drop_image_node(bpy.types.Operator):
     def execute(self, context):
 
         paths = get_image_filepaths(self)
+        image_paths, refbmd_paths = split_refboard_transfer_paths(paths)
 
-        if not paths:
+        if not image_paths and not refbmd_paths:
             return {'CANCELLED'}
 
-        location = get_view_center_location(context)
-        created_nodes = add_image_nodes_from_paths(self, context, paths, location)
+        if image_paths:
+            location = get_view_center_location(context)
+            created_nodes = add_image_nodes_from_paths(self, context, image_paths, location)
 
-        if not created_nodes:
+            if not created_nodes:
+                return {'CANCELLED'}
+
+            return {'FINISHED'}
+
+        imported_boards, imported_images = import_refbmd_files(self, context, refbmd_paths)
+
+        if imported_boards == 0:
             return {'CANCELLED'}
 
+        self.report({'INFO'}, f"Imported {imported_boards} RefBoard file(s), {imported_images} image(s)")
         return {'FINISHED'}
 
 
@@ -1724,10 +2327,10 @@ class RB_OT_drop_image_node(bpy.types.Operator):
 
 class RB_FH_image_drop(bpy.types.FileHandler):
     bl_idname = "RB_FH_image_drop"
-    bl_label = "RefBoard Image Drop"
+    bl_label = "RefBoard File Drop"
 
     bl_import_operator = "refboard.drop_image"
-    bl_file_extensions = ".png;.jpg;.jpeg;.tga;.bmp;.exr;.webp"
+    bl_file_extensions = ".png;.jpg;.jpeg;.tga;.bmp;.exr;.webp;.refbmd"
 
     @classmethod
     def poll_drop(cls, context):
@@ -1756,11 +2359,25 @@ class RB_OT_paste_image_node(bpy.types.Operator):
 
     def execute(self, context):
 
-        paths, pack_clipboard_images = get_clipboard_image_filepaths()
+        paths, pack_clipboard_images = get_clipboard_transfer_filepaths()
 
         if not paths:
-            self.report({'INFO'}, "Clipboard does not contain image data")
+            self.report({'INFO'}, "Clipboard does not contain RefBoard-compatible data")
             return {'CANCELLED'}
+
+        image_paths, refbmd_paths = split_refboard_transfer_paths(paths)
+
+        if refbmd_paths and not image_paths:
+            imported_boards, imported_images = import_refbmd_files(self, context, refbmd_paths)
+
+            if imported_boards == 0:
+                return {'CANCELLED'}
+
+            self.report({'INFO'}, f"Imported {imported_boards} RefBoard file(s), {imported_images} image(s)")
+            return {'FINISHED'}
+
+        if image_paths:
+            paths = image_paths
 
         created_nodes = add_image_nodes_from_paths(
             self,
@@ -1814,6 +2431,135 @@ class RB_OT_add_image_node(bpy.types.Operator):
         if not created_nodes:
             return {'CANCELLED'}
 
+        return {'FINISHED'}
+
+
+# =========================================================
+# REFBMD IMPORT / EXPORT
+# =========================================================
+
+class RB_OT_export_refbmd(bpy.types.Operator):
+    bl_idname = "refboard.export_refbmd"
+    bl_label = "Export"
+    bl_description = "Export the current RefBoard to a portable .refbmd file"
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.refbmd", options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return is_refboard_context(context)
+
+    def invoke(self, context, event):
+        self.filepath = get_refbmd_default_export_path(context.space_data.node_tree)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def check(self, context):
+        filepath = ensure_refbmd_extension(self.filepath)
+
+        if filepath != self.filepath:
+            self.filepath = filepath
+            return True
+
+        return False
+
+    def execute(self, context):
+        tree = context.space_data.node_tree
+        filepath = ensure_refbmd_extension(self.filepath)
+        nodes = [
+            node for node in tree.nodes
+            if node.bl_idname == "RefBoardImageNodeType"
+            and node.image
+        ]
+
+        if not nodes:
+            self.report({'WARNING'}, "Current RefBoard has no images to export")
+            return {'CANCELLED'}
+
+        manifest = {
+            "format": REFBMD_FORMAT,
+            "format_version": REFBMD_FORMAT_VERSION,
+            "nodes": [],
+        }
+
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        except OSError:
+            pass
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="refbmd_export_") as temp_dir:
+                with zipfile.ZipFile(filepath, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+                    for index, node in enumerate(nodes, start=1):
+                        ext = get_image_export_extension(node.image)
+                        archive_path = f"images/image_{index:04d}{ext}"
+                        write_image_to_refbmd(zip_file, node.image, archive_path, temp_dir)
+                        node_entry = {
+                            "image": archive_path,
+                            "location": [float(node.location.x), float(node.location.y)],
+                            "scale": float(node.scale),
+                            "z_order": int(node.z_order),
+                        }
+
+                        rotation_quarters = int(getattr(node, "rotation_quarters", 0)) % 4
+
+                        if rotation_quarters:
+                            node_entry["rotation_quarters"] = rotation_quarters
+
+                        if getattr(node, "flip_x", False):
+                            node_entry["flip_x"] = True
+
+                        if getattr(node, "flip_y", False):
+                            node_entry["flip_y"] = True
+
+                        manifest["nodes"].append(node_entry)
+
+                    zip_file.writestr(
+                        "manifest.json",
+                        json.dumps(manifest, ensure_ascii=False, indent=2)
+                    )
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not export RefBoard: {exc}")
+            return {'CANCELLED'}
+
+        self.filepath = filepath
+        self.report({'INFO'}, f"Exported RefBoard: {os.path.basename(filepath)}")
+        return {'FINISHED'}
+
+
+class RB_OT_import_refbmd(bpy.types.Operator):
+    bl_idname = "refboard.import_refbmd"
+    bl_label = "Import"
+    bl_description = "Import a portable .refbmd RefBoard file"
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.refbmd", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        self.filepath = os.path.join(get_refbmd_default_directory(), "")
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        if not self.filepath or not os.path.isfile(self.filepath):
+            self.report({'ERROR'}, "Choose a .refbmd file to import")
+            return {'CANCELLED'}
+
+        try:
+            tree, imported_count = import_refbmd_file(self, context, self.filepath)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not import RefBoard: {exc}")
+            return {'CANCELLED'}
+
+        if not tree:
+            self.report({'WARNING'}, "No images were imported from this .refbmd file")
+            return {'CANCELLED'}
+
+        set_context_refboard_tree(context, tree)
+        self.report({'INFO'}, f"Imported RefBoard: {tree.name}")
+        tag_refboard_redraw(context)
+        frame_refboard_selected(context, tree)
         return {'FINISHED'}
 
 
@@ -1873,6 +2619,9 @@ class RB_PT_panel(bpy.types.Panel):
         layout.label(text="Images")
         layout.operator("refboard.add_image", icon="IMAGE_DATA")
         layout.operator("refboard.paste_image", icon="PASTEDOWN")
+        row = layout.row(align=True)
+        row.operator("refboard.export_refbmd", icon="EXPORT")
+        row.operator("refboard.import_refbmd", icon="IMPORT")
 
         layout.separator()
 
@@ -1932,6 +2681,7 @@ classes = (
     RefBoardTree,
     RefBoardImageNode,
     RB_OT_z_adjust,
+    RB_OT_image_transform,
     RB_OT_align_nodes,
     RB_OT_align_to_active,
     RB_OT_match_size,
@@ -1942,6 +2692,8 @@ classes = (
     RB_OT_paste_image_node,
     RB_OT_add_image_menu,
     RB_OT_add_image_node,
+    RB_OT_export_refbmd,
+    RB_OT_import_refbmd,
     RB_PT_panel,
 )
 

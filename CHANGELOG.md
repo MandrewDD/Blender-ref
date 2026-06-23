@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0
+
+- Added portable `.refbmd` export and import for RefBoard boards.
+- Added drag/drop and clipboard import support for `.refbmd` files.
+- Added node Image Transform controls for clockwise/counter-clockwise rotation and X/Y mirroring.
+- Image transforms are saved in `.refbmd` files as optional secondary settings.
+- Alignment, selection outlines, hit testing, and size matching now account for rotated image bounds.
+- Automatically frames newly added or imported images in the node editor.
+- `.refbmd` imports now select the imported board images before framing them.
+
 ## 1.3.0
 
 - Added Ctrl+V image paste support in RefBoard.
