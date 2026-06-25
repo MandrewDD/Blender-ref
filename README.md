@@ -30,7 +30,7 @@ Boards: REFBMD.
 Use the packaged zip:
 
 ```text
-release/refboard-1.4.0.zip
+release/refboard-1.4.1.zip
 ```
 
 ## Feedback

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "RefBoard",
     "author": "Mandrew3D <moseenkowam@gmail.com>",
-    "version": (1, 4, 0),
+    "version": (1, 4, 1),
     "blender": (4, 2, 0),
     "category": "Node",
 }
@@ -2162,6 +2162,7 @@ class RefBoardImageNode(bpy.types.Node):
 
         if self.show_image_transform:
             row = box.row(align=True)
+            row.label(text="Rotate")
 
             op = row.operator("refboard.image_transform", text="", icon="LOOP_BACK")
             op.node_name = self.name
@@ -2172,12 +2173,13 @@ class RefBoardImageNode(bpy.types.Node):
             op.mode = "ROTATE_CW"
 
             row = box.row(align=True)
+            row.label(text="Flip")
 
-            op = row.operator("refboard.image_transform", text="Flip X", icon="FORWARD")
+            op = row.operator("refboard.image_transform", text="", icon="FORWARD")
             op.node_name = self.name
             op.mode = "FLIP_X"
 
-            op = row.operator("refboard.image_transform", text="Flip Y", icon="SORT_DESC")
+            op = row.operator("refboard.image_transform", text="", icon="SORT_DESC")
             op.node_name = self.name
             op.mode = "FLIP_Y"
 
