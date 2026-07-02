@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "refboard"
-version = "1.4.1"
+version = "1.5.2"
 name = "RefBoard"
 tagline = "Arrange image references inside a dedicated node editor"
 maintainer = "Mandrew3D <moseenkowam@gmail.com>"
@@ -10,8 +10,12 @@ type = "add-on"
 
 tags = ["Node", "User Interface"]
 blender_version_min = "4.2.0"
+platforms = ["windows-x64"]
 license = ["SPDX:GPL-3.0-or-later"]
 copyright = ["2026 Mandrew3D"]
+wheels = [
+    "./wheels/pypdfium2-5.10.1-py3-none-win_amd64.whl",
+]
 
 [permissions]
 files = "Load selected, dropped, or pasted images"

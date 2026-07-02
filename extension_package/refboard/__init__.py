@@ -1,7 +1,7 @@
 bl_info = {
     "name": "RefBoard",
     "author": "Mandrew3D <moseenkowam@gmail.com>",
-    "version": (1, 4, 1),
+    "version": (1, 5, 2),
     "blender": (4, 2, 0),
     "category": "Node",
 }
@@ -9,13 +9,19 @@ bl_info = {
 import bpy
 import gpu
 import gpu.texture
+import blf
+import binascii
 import ctypes
 import json
 import math
 import os
+import shutil
 import struct
+import subprocess
 import tempfile
+import time
 import zipfile
+import zlib
 from gpu_extras.batch import batch_for_shader
 
 _handle = None
@@ -25,6 +31,7 @@ _click_candidate = None
 _menu_added = False
 _image_shader = None
 _scale_overlay = None
+_import_progress = None
 NODE_HEADER_HEIGHT = 120
 NODE_SPACING = 50
 DRAW_HANDLER_TYPE = "PRE_VIEW"
@@ -40,9 +47,18 @@ TRANSFORM_ARROW_SIZE = 5.0
 SCALE_EPSILON = 0.0001
 CLICK_DRAG_THRESHOLD = 5
 IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".exr", ".webp"}
+PDF_FILE_EXTENSION = ".pdf"
+PDF_IMPORT_DPI = 200
+PROGRESS_REDRAW_INTERVAL = 0.05
+PDF_RENDER_START_PROGRESS = 0.08
+PDF_RENDER_ACTIVITY_PROGRESS = 0.18
 REFBMD_EXTENSION = ".refbmd"
 REFBMD_FORMAT = "refbmd"
 REFBMD_FORMAT_VERSION = 1
+REFBMD_MAX_MANIFEST_BYTES = 1024 * 1024
+REFBMD_MAX_NODES = 512
+REFBMD_MAX_IMAGE_BYTES = 100 * 1024 * 1024
+REFBMD_MAX_TOTAL_IMAGE_BYTES = 512 * 1024 * 1024
 IMAGE_SHADER_BUILTINS = (
     "IMAGE_SCENE_LINEAR_TO_REC709_SRGB",
 )
@@ -105,7 +121,6 @@ NUMERIC_INPUT_KEYS = {
     "NUMPAD_8": "8",
     "NUMPAD_9": "9",
 }
-
 
 # =========================================================
 # CONTEXT
@@ -173,6 +188,40 @@ def align_nodes_col(nodes, active):
 
         n.location.x = x
         n.location.y = start_y - offset_y
+
+
+def get_node_group_width(nodes):
+    if not nodes:
+        return 0.0
+
+    return max(get_node_image_width(n) for n in nodes)
+
+
+def layout_imported_node_groups(groups, location):
+    if not groups:
+        return
+
+    offset_x = 0.0
+
+    for group in groups:
+        nodes = group.get("nodes", [])
+
+        if not nodes:
+            continue
+
+        group_x = location[0] + offset_x
+        group_y = location[1]
+
+        if group.get("type") == "pdf":
+            nodes[0].location.x = group_x
+            nodes[0].location.y = group_y
+            align_nodes_col(nodes, nodes[0])
+        else:
+            for node in nodes:
+                node.location.x = group_x
+                node.location.y = group_y
+
+        offset_x += get_node_group_width(nodes) + NODE_SPACING
 
 
 def align_nodes_grid(nodes, active):
@@ -448,6 +497,14 @@ def is_supported_image_path(filepath):
     return os.path.splitext(filepath)[1].lower() in IMAGE_FILE_EXTENSIONS
 
 
+def is_supported_pdf_path(filepath):
+    return os.path.splitext(filepath)[1].lower() == PDF_FILE_EXTENSION
+
+
+def is_supported_add_image_path(filepath):
+    return is_supported_image_path(filepath) or is_supported_pdf_path(filepath)
+
+
 def is_supported_refbmd_path(filepath):
     return os.path.splitext(filepath)[1].lower() == REFBMD_EXTENSION
 
@@ -460,7 +517,7 @@ def split_refboard_transfer_paths(paths):
         if not os.path.isfile(filepath):
             continue
 
-        if is_supported_image_path(filepath):
+        if is_supported_add_image_path(filepath):
             image_paths.append(filepath)
         elif is_supported_refbmd_path(filepath):
             refbmd_paths.append(filepath)
@@ -526,7 +583,7 @@ def get_clipboard_hdrop_filepaths():
 
         if (
             os.path.isfile(filepath)
-            and (is_supported_image_path(filepath) or is_supported_refbmd_path(filepath))
+            and (is_supported_add_image_path(filepath) or is_supported_refbmd_path(filepath))
         ):
             paths.append(filepath)
 
@@ -618,6 +675,450 @@ def save_dib_to_temp_bmp(dib_bytes):
         return temp_file.name
 
 
+def begin_refboard_progress(context, total):
+    global _import_progress
+
+    total = max(float(total), 1.0)
+    window_manager = getattr(context, "window_manager", None)
+    window = getattr(context, "window", None)
+    progress = {
+        "window_manager": window_manager,
+        "window": window,
+        "total": total,
+        "last_redraw": 0.0,
+        "last_percent": None,
+    }
+    _import_progress = {
+        "percent": 0,
+        "text": "RefBoard importing files...",
+    }
+
+    update_refboard_progress(progress, 0.0)
+    return progress
+
+
+def set_refboard_progress_status(progress, value):
+    global _import_progress
+
+    if not progress:
+        return
+
+    total = progress.get("total", 1.0)
+    percent = int(round((min(max(float(value), 0.0), total) / total) * 100.0))
+
+    if percent == progress.get("last_percent"):
+        return
+
+    progress["last_percent"] = percent
+    _import_progress = {
+        "percent": percent,
+        "text": f"RefBoard importing files... {percent}%",
+    }
+
+
+def update_refboard_progress(progress, value):
+    if not progress:
+        return
+
+    window_manager = progress.get("window_manager")
+
+    if not window_manager:
+        return
+
+    total = progress.get("total", 1.0)
+    value = min(max(float(value), 0.0), total)
+
+    set_refboard_progress_status(progress, value)
+
+    now = time.monotonic()
+    last_redraw = progress.get("last_redraw", 0.0)
+
+    if now - last_redraw < PROGRESS_REDRAW_INTERVAL and value < total:
+        return
+
+    progress["last_redraw"] = now
+
+    try:
+        for window in getattr(window_manager, "windows", []):
+            screen = getattr(window, "screen", None)
+
+            if not screen:
+                continue
+
+            for area in getattr(screen, "areas", []):
+                area.tag_redraw()
+    except Exception as exc:
+        print(f"RefBoard: could not tag progress redraw: {exc}")
+
+    try:
+        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+    except Exception:
+        pass
+
+
+def end_refboard_progress(progress):
+    global _import_progress
+
+    if not progress:
+        return
+
+    window_manager = progress.get("window_manager")
+    window = progress.get("window")
+    _import_progress = None
+
+    if window:
+        try:
+            window.cursor_set("DEFAULT")
+        except Exception as exc:
+            print(f"RefBoard: could not restore cursor: {exc}")
+
+    try:
+        for window in getattr(window_manager, "windows", []):
+            screen = getattr(window, "screen", None)
+
+            if not screen:
+                continue
+
+            for area in getattr(screen, "areas", []):
+                area.tag_redraw()
+    except Exception as exc:
+        print(f"RefBoard: could not tag progress redraw: {exc}")
+
+    try:
+        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+    except Exception:
+        pass
+
+
+def get_pdf_render_temp_dir():
+    directory = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), "refboard_pdf")
+    os.makedirs(directory, exist_ok=True)
+    return tempfile.mkdtemp(prefix="pdf_", dir=directory)
+
+
+def get_pdf_page_image_name(pdf_path, page_index):
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0] or "PDF"
+    return f"{base_name} - Page {page_index + 1}"
+
+
+def render_pdf_with_pymupdf(pdf_path, output_dir, dpi, progress_callback=None):
+    try:
+        import fitz
+    except ImportError:
+        return None
+
+    output_paths = []
+
+    try:
+        document = fitz.open(pdf_path)
+    except Exception as exc:
+        print(f"RefBoard: PyMuPDF could not open PDF {pdf_path!r}: {exc}")
+        return None
+
+    try:
+        for index, page in enumerate(document):
+            output_path = os.path.join(output_dir, f"page_{index + 1:04d}.png")
+
+            if hasattr(page, "get_pixmap"):
+                try:
+                    pixmap = page.get_pixmap(dpi=dpi, alpha=False)
+                except TypeError:
+                    scale = dpi / 72.0
+                    pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            else:
+                return None
+
+            pixmap.save(output_path)
+            output_paths.append(output_path)
+
+            if progress_callback:
+                progress_callback(index + 1, len(document))
+    except Exception as exc:
+        print(f"RefBoard: PyMuPDF could not render PDF {pdf_path!r}: {exc}")
+        return None
+    finally:
+        document.close()
+
+    return output_paths
+
+
+def get_pypdfium2_page_count(pdf_path):
+    try:
+        import pypdfium2
+        document = pypdfium2.PdfDocument(pdf_path)
+    except Exception as exc:
+        print(f"RefBoard: pypdfium2 could not open PDF {pdf_path!r}: {exc}")
+        return None
+
+    try:
+        return len(document)
+    finally:
+        if hasattr(document, "close"):
+            document.close()
+
+
+def write_png_chunk(output_file, chunk_type, data):
+    output_file.write(struct.pack(">I", len(data)))
+    output_file.write(chunk_type)
+    output_file.write(data)
+    checksum = binascii.crc32(chunk_type)
+    checksum = binascii.crc32(data, checksum)
+    output_file.write(struct.pack(">I", checksum & 0xFFFFFFFF))
+
+
+def save_pdfium_bitmap_as_png(bitmap, output_path):
+    width = bitmap.width
+    height = bitmap.height
+    row_size = width * 3
+    png_rows = bytearray((row_size + 1) * height)
+    buffer = bitmap.buffer
+    write_offset = 0
+
+    for y in range(height):
+        png_rows[write_offset] = 0
+        write_offset += 1
+        read_offset = y * bitmap.stride
+
+        for x in range(0, row_size, 3):
+            b = buffer[read_offset + x]
+            g = buffer[read_offset + x + 1]
+            r = buffer[read_offset + x + 2]
+            png_rows[write_offset] = r
+            png_rows[write_offset + 1] = g
+            png_rows[write_offset + 2] = b
+            write_offset += 3
+
+    with open(output_path, "wb") as output_file:
+        output_file.write(b"\x89PNG\r\n\x1a\n")
+        write_png_chunk(output_file, b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        write_png_chunk(output_file, b"IDAT", zlib.compress(bytes(png_rows), 6))
+        write_png_chunk(output_file, b"IEND", b"")
+
+
+def render_pdfium_page_chunk(pdf_path, output_dir, page_indices, scale, progress_callback=None):
+    import pypdfium2
+
+    document = pypdfium2.PdfDocument(pdf_path)
+    output_paths = []
+
+    try:
+        total_pages = len(page_indices)
+
+        for offset, index in enumerate(page_indices):
+            output_path = os.path.join(output_dir, f"page_{index + 1:04d}.png")
+            page = document[index]
+            bitmap = None
+
+            try:
+                bitmap = page.render(scale=scale)
+                save_pdfium_bitmap_as_png(bitmap, output_path)
+            finally:
+                if bitmap and hasattr(bitmap, "close"):
+                    bitmap.close()
+
+                if hasattr(page, "close"):
+                    page.close()
+
+            output_paths.append(output_path)
+
+            if progress_callback:
+                progress_callback(offset + 1, total_pages)
+    finally:
+        if hasattr(document, "close"):
+            document.close()
+
+    return output_paths
+
+
+def render_pdf_with_pypdfium2(pdf_path, output_dir, dpi, progress_callback=None):
+    try:
+        import pypdfium2
+    except ImportError:
+        return None
+
+    page_count = get_pypdfium2_page_count(pdf_path)
+
+    if page_count is None:
+        return None
+
+    if page_count <= 0:
+        return []
+
+    scale = dpi / 72.0
+    if progress_callback:
+        progress_callback(page_count * PDF_RENDER_START_PROGRESS, page_count)
+
+    try:
+        return render_pdfium_page_chunk(
+            pdf_path,
+            output_dir,
+            range(page_count),
+            scale,
+            progress_callback=progress_callback
+        )
+    except Exception as exc:
+        print(f"RefBoard: pypdfium2 could not render PDF {pdf_path!r}: {exc}")
+        return None
+
+
+def get_subprocess_startupinfo():
+    if os.name != "nt":
+        return None
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return startupinfo
+
+
+def run_pdf_render_command(command):
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=get_subprocess_startupinfo(),
+            check=False
+        )
+    except OSError as exc:
+        print(f"RefBoard: could not start PDF renderer {command[0]!r}: {exc}")
+        return False
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        print(f"RefBoard: PDF renderer failed ({command[0]!r}): {stderr}")
+        return False
+
+    return True
+
+
+def get_numbered_output_paths(output_dir, extension):
+    paths = []
+
+    for name in os.listdir(output_dir):
+        if os.path.splitext(name)[1].lower() == extension:
+            paths.append(os.path.join(output_dir, name))
+
+    def page_number(path):
+        name = os.path.splitext(os.path.basename(path))[0]
+        number = ""
+
+        for char in reversed(name):
+            if char.isdigit():
+                number = char + number
+            elif number:
+                break
+
+        return int(number) if number else 0
+
+    return sorted(paths, key=page_number)
+
+
+def render_pdf_with_poppler(pdf_path, output_dir, dpi, progress_callback=None):
+    renderer = shutil.which("pdftoppm") or shutil.which("pdftocairo")
+
+    if not renderer:
+        return None
+
+    prefix = os.path.join(output_dir, "page")
+
+    if os.path.basename(renderer).lower().startswith("pdftocairo"):
+        command = [renderer, "-png", "-r", str(dpi), pdf_path, prefix]
+    else:
+        command = [renderer, "-png", "-r", str(dpi), pdf_path, prefix]
+
+    if not run_pdf_render_command(command):
+        return None
+
+    output_paths = get_numbered_output_paths(output_dir, ".png")
+
+    if progress_callback and output_paths:
+        progress_callback(len(output_paths), len(output_paths))
+
+    return output_paths
+
+
+def render_pdf_with_ghostscript(pdf_path, output_dir, dpi, progress_callback=None):
+    renderer = (
+        shutil.which("gswin64c")
+        or shutil.which("gswin32c")
+        or shutil.which("gs")
+    )
+
+    if not renderer:
+        return None
+
+    output_pattern = os.path.join(output_dir, "page_%04d.png")
+    command = [
+        renderer,
+        "-dSAFER",
+        "-dBATCH",
+        "-dNOPAUSE",
+        "-sDEVICE=png16m",
+        f"-r{dpi}",
+        f"-sOutputFile={output_pattern}",
+        pdf_path,
+    ]
+
+    if not run_pdf_render_command(command):
+        return None
+
+    output_paths = get_numbered_output_paths(output_dir, ".png")
+
+    if progress_callback and output_paths:
+        progress_callback(len(output_paths), len(output_paths))
+
+    return output_paths
+
+
+def clear_pdf_render_output(output_dir):
+    for name in os.listdir(output_dir):
+        path = os.path.join(output_dir, name)
+
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError as exc:
+                print(f"RefBoard: could not remove stale PDF render file {path!r}: {exc}")
+
+
+def render_pdf_to_image_paths(operator, pdf_path, progress=None, progress_start=0.0, progress_span=1.0):
+    output_dir = get_pdf_render_temp_dir()
+
+    def update_pdf_progress(done, total):
+        if not total:
+            return
+
+        update_refboard_progress(
+            progress,
+            progress_start + progress_span * (done / total)
+        )
+
+    renderers = (
+        render_pdf_with_pymupdf,
+        render_pdf_with_pypdfium2,
+        render_pdf_with_poppler,
+        render_pdf_with_ghostscript,
+    )
+
+    for renderer in renderers:
+        clear_pdf_render_output(output_dir)
+        rendered_paths = renderer(
+            pdf_path,
+            output_dir,
+            PDF_IMPORT_DPI,
+            progress_callback=update_pdf_progress
+        )
+
+        if rendered_paths:
+            update_refboard_progress(progress, progress_start + progress_span)
+            return rendered_paths, output_dir
+
+    operator.report({'WARNING'}, f"Could not render PDF: {pdf_path}")
+    print(f"RefBoard: no available PDF renderer for {pdf_path!r}")
+    shutil.rmtree(output_dir, ignore_errors=True)
+    return [], None
+
+
 def add_image_nodes_from_paths(
     operator,
     context,
@@ -628,42 +1129,92 @@ def add_image_nodes_from_paths(
     cleanup_files=False
 ):
     tree = context.space_data.node_tree
+    progress = begin_refboard_progress(context, max(len(paths), 1) * 100.0)
 
-    for node in tree.nodes:
-        node.select = False
+    try:
+        for node in tree.nodes:
+            node.select = False
 
-    created_nodes = []
+        created_nodes = []
+        created_groups = []
 
-    for filepath in paths:
-        img = load_image_for_operator(
-            operator,
-            filepath,
-            pack_image=pack_images,
-            cleanup_file=cleanup_files
-        )
+        for file_index, filepath in enumerate(paths):
+            file_progress_start = file_index * 100.0
+            file_is_pdf = is_supported_pdf_path(filepath)
 
-        if not img:
-            continue
+            if file_is_pdf:
+                image_paths, temp_dir = render_pdf_to_image_paths(
+                    operator,
+                    filepath,
+                    progress=progress,
+                    progress_start=file_progress_start,
+                    progress_span=75.0
+                )
+                pack_current_images = True
+                cleanup_current_files = True
+                load_progress_start = file_progress_start + 75.0
+                load_progress_span = 25.0
+            else:
+                image_paths = [filepath]
+                temp_dir = None
+                pack_current_images = pack_images
+                cleanup_current_files = cleanup_files
+                load_progress_start = file_progress_start
+                load_progress_span = 100.0
 
-        node = tree.nodes.new("RefBoardImageNodeType")
-        node.image = img
-        node.location = location
+            image_count = max(len(image_paths), 1)
+            group_nodes = []
 
-        node.select = True
-        created_nodes.append(node)
+            for image_index, image_path in enumerate(image_paths):
+                img = load_image_for_operator(
+                    operator,
+                    image_path,
+                    pack_image=pack_current_images,
+                    cleanup_file=cleanup_current_files
+                )
 
-    if not created_nodes:
-        return []
+                update_refboard_progress(
+                    progress,
+                    load_progress_start + load_progress_span * ((image_index + 1) / image_count)
+                )
 
-    tree.nodes.active = created_nodes[0]
+                if not img:
+                    continue
 
-    if align_multiple and len(created_nodes) > 1:
-        align_nodes_row(created_nodes, created_nodes[0])
+                if file_is_pdf:
+                    img.name = get_pdf_page_image_name(filepath, image_index)
 
-    tag_refboard_redraw(context)
-    frame_refboard_selected(context, tree)
+                node = tree.nodes.new("RefBoardImageNodeType")
+                node.image = img
+                node.location = location
 
-    return created_nodes
+                node.select = True
+                created_nodes.append(node)
+                group_nodes.append(node)
+
+            if group_nodes:
+                created_groups.append({
+                    "type": "pdf" if file_is_pdf else "image",
+                    "nodes": group_nodes,
+                })
+
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if not created_nodes:
+            return []
+
+        tree.nodes.active = created_nodes[0]
+
+        if align_multiple:
+            layout_imported_node_groups(created_groups, location)
+
+        tag_refboard_redraw(context)
+        frame_refboard_selected(context, tree)
+
+        return created_nodes
+    finally:
+        end_refboard_progress(progress)
 
 
 def sanitize_refbmd_filename(name):
@@ -814,6 +1365,37 @@ def safe_refbmd_member_path(path):
     return normalized
 
 
+def read_refbmd_member_limited(zip_file, member_path, max_size):
+    try:
+        info = zip_file.getinfo(member_path)
+    except KeyError:
+        return None
+
+    if info.file_size > max_size:
+        raise ValueError(f"Archive member is too large: {member_path}")
+
+    data = bytearray()
+
+    with zip_file.open(info, "r") as member_file:
+        while True:
+            remaining = max_size + 1 - len(data)
+
+            if remaining <= 0:
+                raise ValueError(f"Archive member is too large: {member_path}")
+
+            chunk = member_file.read(min(65536, remaining))
+
+            if not chunk:
+                break
+
+            data.extend(chunk)
+
+            if len(data) > max_size:
+                raise ValueError(f"Archive member is too large: {member_path}")
+
+    return bytes(data)
+
+
 def import_refbmd_file(operator, context, filepath):
     board_base_name = os.path.splitext(os.path.basename(filepath))[0]
     board_name = get_unique_refboard_name(board_base_name)
@@ -823,16 +1405,30 @@ def import_refbmd_file(operator, context, filepath):
     try:
         with tempfile.TemporaryDirectory(prefix="refbmd_import_") as temp_dir:
             with zipfile.ZipFile(filepath, "r") as zip_file:
-                manifest = json.loads(zip_file.read("manifest.json").decode("utf-8"))
+                manifest_bytes = read_refbmd_member_limited(
+                    zip_file,
+                    "manifest.json",
+                    REFBMD_MAX_MANIFEST_BYTES
+                )
+
+                if manifest_bytes is None:
+                    raise ValueError("RefBoard archive is missing manifest.json")
+
+                manifest = json.loads(manifest_bytes.decode("utf-8"))
 
                 if not isinstance(manifest, dict):
                     manifest = {}
+
+                if manifest.get("format") != REFBMD_FORMAT:
+                    raise ValueError("Unsupported RefBoard archive format")
 
                 node_entries = manifest.get("nodes", [])
 
                 if not isinstance(node_entries, list):
                     node_entries = []
 
+                node_entries = node_entries[:REFBMD_MAX_NODES]
+                total_image_bytes = 0
                 tree = bpy.data.node_groups.new(board_name, "RefBoardTreeType")
 
                 for index, node_data in enumerate(node_entries):
@@ -841,7 +1437,7 @@ def import_refbmd_file(operator, context, filepath):
 
                     archive_path = safe_refbmd_member_path(node_data.get("image"))
 
-                    if not archive_path or archive_path not in zip_file.namelist():
+                    if not archive_path:
                         continue
 
                     image_ext = os.path.splitext(archive_path)[1].lower()
@@ -849,10 +1445,28 @@ def import_refbmd_file(operator, context, filepath):
                     if image_ext not in IMAGE_FILE_EXTENSIONS:
                         image_ext = ".png"
 
+                    try:
+                        image_data = read_refbmd_member_limited(
+                            zip_file,
+                            archive_path,
+                            REFBMD_MAX_IMAGE_BYTES
+                        )
+                    except ValueError as exc:
+                        print(f"RefBoard: skipped archive image {archive_path!r}: {exc}")
+                        continue
+
+                    if image_data is None:
+                        continue
+
+                    if total_image_bytes + len(image_data) > REFBMD_MAX_TOTAL_IMAGE_BYTES:
+                        print(f"RefBoard: skipped archive image {archive_path!r}: import size limit reached")
+                        continue
+
+                    total_image_bytes += len(image_data)
                     temp_image_path = os.path.join(temp_dir, f"image_{index:04d}{image_ext}")
 
                     with open(temp_image_path, "wb") as temp_image_file:
-                        temp_image_file.write(zip_file.read(archive_path))
+                        temp_image_file.write(image_data)
 
                     image = load_image_for_operator(operator, temp_image_path)
 
@@ -1252,6 +1866,57 @@ def draw_line_coords(coords, width, color):
     batch.draw(shader)
 
 
+def draw_filled_rect(x, y, width, height, color):
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "TRIS", {
+        "pos": (
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y),
+            (x + width, y + height),
+            (x, y + height),
+        )
+    })
+
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def draw_import_progress_overlay():
+    if not _import_progress:
+        return
+
+    region = bpy.context.region
+
+    if not region:
+        return
+
+    percent = max(0, min(100, int(_import_progress.get("percent", 0))))
+    text = _import_progress.get("text") or f"RefBoard importing files... {percent}%"
+    width = min(360.0, max(260.0, region.width - 48.0))
+    height = 58.0
+    x = (region.width - width) * 0.5
+    y = max(24.0, region.height - height - 42.0)
+    padding = 14.0
+    bar_height = 8.0
+    bar_width = width - padding * 2.0
+    bar_x = x + padding
+    bar_y = y + padding
+    fill_width = bar_width * (percent / 100.0)
+
+    draw_filled_rect(x, y, width, height, (0.05, 0.055, 0.06, 0.88))
+    draw_filled_rect(bar_x, bar_y, bar_width, bar_height, (0.18, 0.19, 0.20, 1.0))
+    draw_filled_rect(bar_x, bar_y, fill_width, bar_height, (0.34, 0.58, 0.95, 1.0))
+
+    font_id = 0
+    blf.size(font_id, 14)
+    blf.color(font_id, 0.92, 0.94, 0.96, 1.0)
+    blf.position(font_id, x + padding, y + 32.0, 0.0)
+    blf.draw(font_id, text)
+
+
 def get_image_shader():
     global _image_shader
 
@@ -1344,6 +2009,7 @@ def draw_scale_overlay_callback():
     gpu.state.blend_set('ALPHA')
 
     try:
+        draw_import_progress_overlay()
         draw_scale_overlay()
     finally:
         gpu.state.line_width_set(1.0)
@@ -2332,7 +2998,7 @@ class RB_FH_image_drop(bpy.types.FileHandler):
     bl_label = "RefBoard File Drop"
 
     bl_import_operator = "refboard.drop_image"
-    bl_file_extensions = ".png;.jpg;.jpeg;.tga;.bmp;.exr;.webp;.refbmd"
+    bl_file_extensions = ".png;.jpg;.jpeg;.tga;.bmp;.exr;.webp;.pdf;.refbmd"
 
     @classmethod
     def poll_drop(cls, context):
@@ -2408,7 +3074,11 @@ class RB_OT_add_image_node(bpy.types.Operator):
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
     directory: bpy.props.StringProperty(subtype="DIR_PATH")
     files: bpy.props.CollectionProperty(type=bpy.types.OperatorFileListElement)
-    filter_image: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
+    filter_image: bpy.props.BoolProperty(default=False, options={'HIDDEN'})
+    filter_glob: bpy.props.StringProperty(
+        default="*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.exr;*.webp;*.pdf",
+        options={'HIDDEN'}
+    )
     location: bpy.props.FloatVectorProperty(size=2)
 
     @classmethod

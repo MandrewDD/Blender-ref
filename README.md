@@ -6,9 +6,9 @@ It is made for quick boards: drop in images, paste screenshots, arrange referenc
 
 ## Features
 
-- Drag and drop images into a RefBoard node tree.
+- Drag and drop images and PDFs into a RefBoard node tree.
 - Paste images from the clipboard with Ctrl + V.
-- Add one or several images from the sidebar.
+- Add one or several images or PDFs from the sidebar.
 - Add images through Shift + A.
 - Arrange selected images as a row, column, or automatic grid.
 - Align selected images to the active image.
@@ -18,10 +18,13 @@ It is made for quick boards: drop in images, paste screenshots, arrange referenc
 - Draw images behind their nodes with Blender-style outlines.
 - Pack pasted clipboard bitmap images into the `.blend` file.
 - Export and import portable `.refbmd` RefBoard files.
+- Import PDFs as one image node per page.
 
 ## Supported Formats
 
 Images: PNG, JPG, JPEG, TGA, BMP, EXR, and WEBP.
+
+Documents: PDF when a compatible renderer is available.
 
 Boards: REFBMD.
 
@@ -30,7 +33,7 @@ Boards: REFBMD.
 Use the packaged zip:
 
 ```text
-release/refboard-1.4.1.zip
+release/refboard-1.5.2.zip
 ```
 
 ## Feedback

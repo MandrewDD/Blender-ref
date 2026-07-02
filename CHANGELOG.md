@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.5.2
+
+- Reverted the unsafe 1.5.1 runtime wheel-loading approach.
+- Kept the Windows x64 extension packaging model with the official bundled PDF renderer wheel.
+- Removed PDF worker subprocess code that referenced the `sys` module.
+- Hardened `.refbmd` imports with format validation and size limits for manifests, node counts, and embedded images.
+
+## 1.5.0
+
+- Added PDF import support for Add Image, drag and drop, and clipboard file paths.
+- PDF pages are rendered into separate image nodes and packed into the `.blend` file.
+- PDF pages are arranged top-to-bottom as a separate column when mixed with regular image imports.
+- Added an in-editor import progress overlay for longer image and PDF imports.
+- Added a bundled Windows x64 PDF rendering wheel for Blender Extensions packaging.
+- PDF rendering uses multiple worker processes when possible, with fallback renderers for reliability.
+
 ## 1.4.1
 
 - Fixed automatic framing after adding, dropping, pasting, or importing images.
